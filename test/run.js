@@ -399,6 +399,57 @@ test("the panel shows the day's events, follows the daily note and goes back to 
   assert.strictEqual(view.day, "2026-11-20", "opening a daily note shows its day");
 });
 
+test("an error for a day left behind is not shown on the day shown", async () => {
+  const plugin = await signedInPlugin();
+  let fail;
+  global.__handler = () => new Promise((resolve) => (fail = resolve));
+  const view = await openView(plugin);
+  global.__layoutReady();
+  await new Promise((r) => setTimeout(r, 10));
+  plugin.dayCache().set("2026-12-01", { events: [], fetchedAt: Date.now() });
+  view.setDay("2026-12-01", false);
+  fail({ status: 500, body: { error: { message: "boom" } } });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.strictEqual(view.error, null);
+});
+
+test("midnight moves a panel showing today on, but not one following a daily note", async () => {
+  const plugin = await signedInPlugin();
+  global.__handler = () => ({ body: { value: [] } });
+  const view = await openView(plugin);
+  global.__layoutReady();
+  await new Promise((r) => setTimeout(r, 10));
+  const today = localToday();
+  view.day = view.lastToday = addDays(today, -1);
+  view.tick();
+  assert.strictEqual(view.day, today);
+  view.followNote(addDays(today, -1));
+  view.lastToday = addDays(today, -1);
+  view.tick();
+  assert.strictEqual(view.day, addDays(today, -1), "stays on the open daily note's day");
+});
+
+test("an empty today is not rebuilt every minute", async () => {
+  const plugin = await signedInPlugin();
+  global.__handler = () => ({ body: { value: [] } });
+  const view = await openView(plugin);
+  global.__layoutReady();
+  await new Promise((r) => setTimeout(r, 10));
+  let renders = 0;
+  const render = view.render.bind(view);
+  view.render = () => (renders++, render());
+  view.tick();
+  view.tick();
+  assert.strictEqual(renders, 0);
+});
+
+test("a nested daily note format matches the path, not a bare day number", async () => {
+  const plugin = await signedInPlugin();
+  plugin.settings.dailyNoteFormat = "YYYY/MM/DD";
+  assert.strictEqual(plugin.dailyNoteDate({ basename: "17", path: "journals/2025/03/17.md" }), "2025-03-17");
+  assert.strictEqual(plugin.dailyNoteDate({ basename: "17", path: "Projects/17.md" }), null);
+});
+
 test("+ and the agenda command insert events with the template", async () => {
   const plugin = await signedInPlugin();
   let text = ["# 2026-11-17", "- Notes"];

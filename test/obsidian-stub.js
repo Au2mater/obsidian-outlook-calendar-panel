@@ -64,8 +64,9 @@ const pad = (n) => String(n).padStart(2, "0");
 // a YYYY-MM-DD file name strictly.
 function moment(value, format) {
   if (typeof value === "string") {
-    const ok = format === "YYYY-MM-DD" && /^\d{4}-\d{2}-\d{2}$/.test(value);
-    return { isValid: () => ok, format: () => value };
+    const pattern = { "YYYY-MM-DD": /^\d{4}-\d{2}-\d{2}$/, "YYYY/MM/DD": /^\d{4}\/\d{2}\/\d{2}$/ }[format];
+    const ok = Boolean(pattern && pattern.test(value));
+    return { isValid: () => ok, format: () => value.replace(/\//g, "-") };
   }
   const d = new Date(value);
   return {

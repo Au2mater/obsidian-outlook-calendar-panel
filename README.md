@@ -27,10 +27,10 @@ trademark of Microsoft.
 The plugin is built not to slow Obsidian down:
 
 - Loading the plugin only registers the panel, its commands and settings. It
-  makes no network request and does not read the sign-in until the panel is
-  used.
-- The panel shows the last fetched events at once, and fetches only after
-  Obsidian has finished starting and is idle. Nothing waits for Microsoft.
+  makes no network request and does not read the sign-in.
+- The panel reads the sign-in and the last fetched events only once Obsidian
+  has finished starting and is idle, shows those events at once, then
+  fetches. Nothing waits for Microsoft.
 - A panel that is not on screen (a collapsed sidebar or a background tab)
   does nothing. It catches up when you show it.
 - There are no listeners on typing or saving. The plugin reacts only to
@@ -97,7 +97,8 @@ because each plugin keeps its own sign-in.
 2. Enter the client ID and tenant: your directory (tenant) ID for an app
    limited to your organisation, `consumers` for personal accounts only, or
    `common` for both.
-3. Select **Sign in**. A dialog shows a short code. Open the Microsoft page,
+3. Select **Sign in**. The dialog shows the client ID and tenant to check;
+   select **Continue** and it shows a short code. Open the Microsoft page,
    enter the code and sign in. The dialog closes by itself and the panel fills.
 
 Open the panel from the ribbon icon or with the command **Outlook Calendar Panel: Open panel**.

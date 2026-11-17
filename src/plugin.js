@@ -173,6 +173,13 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
     new Notice("Signed out of Microsoft.");
   }
 
+  // The sign-in expired: forget its events, as signing out does.
+  sessionEnded() {
+    this.days = new Map();
+    this.saveDayCache();
+    this.refreshSettingTab();
+  }
+
   signedIn() {
     const who = this.auth.account ? ` as ${this.auth.account}` : "";
     new Notice(`Signed in to Microsoft${who}.`);
@@ -279,7 +286,11 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
   dailyNoteDate(file) {
     if (!file || !file.basename) return null;
     const format = (this.settings.dailyNoteFormat || "").trim() || "YYYY-MM-DD";
-    const parsed = moment(file.basename, format.split("/").pop(), true);
+    // A format with folders ("YYYY/MM/DD") is matched against as many of
+    // the path's last parts, so a note named "17" alone is no daily note.
+    const parts = format.split("/").length;
+    const name = parts > 1 && file.path ? file.path.replace(/\.md$/i, "").split("/").slice(-parts).join("/") : file.basename;
+    const parsed = moment(name, format, true);
     return parsed.isValid() ? parsed.format("YYYY-MM-DD") : null;
   }
 
@@ -396,6 +407,8 @@ class CalendarPanelView extends ItemView {
       : null;
     if (noteDay) this.day = noteDay;
     this.noteDate = noteDay;
+    // Only the title for now: the events need the sign-in and the cache,
+    // which are read once the app is idle, not while Obsidian waits for this.
     this.render();
 
     // Obsidian waits for onOpen while it restores the workspace, so the fetch
@@ -406,6 +419,7 @@ class CalendarPanelView extends ItemView {
         this.ready = true;
         // The active note may not have been known yet while restoring.
         if (this.plugin.settings.followDailyNote) this.followNote(this.plugin.dailyNoteDate(this.app.workspace.getActiveFile()));
+        this.render();
         if (this.isVisible()) this.refresh(false);
       };
       if (window.requestIdleCallback) window.requestIdleCallback(start, { timeout: 3000 });
@@ -436,12 +450,19 @@ class CalendarPanelView extends ItemView {
   // Once a minute while on screen, and when the panel comes into view.
   tick() {
     const today = localToday();
-    if (this.lastToday && this.lastToday !== today && this.following && this.day === this.lastToday) {
+    if (this.lastToday !== today) {
+      const yesterday = this.lastToday;
       this.lastToday = today;
-      this.setDay(today, true);
-      return;
+      // Past midnight, a panel showing today by default moves on; one that
+      // follows an open daily note, or shows a day the user picked, stays.
+      if (this.following && !this.noteDate && this.day === yesterday) {
+        this.setDay(today, true);
+        return;
+      }
+      this.render(); // the "Today" title and button
     }
-    this.lastToday = today;
+    // Signed out, the sign-in box stays as it is (and keeps its focus).
+    if (!this.plugin.auth.signedIn) return;
     if (this.isStale()) this.refresh(false);
     // Moves the "now" highlight, rebuilding only when an event's state changed.
     else if (this.day === today && this.nowKey !== this.timeStates()) this.render();
@@ -501,11 +522,8 @@ class CalendarPanelView extends ItemView {
     try {
       await this.plugin.loadDay(day);
     } catch (e) {
-      if (e.expired) {
-        this.plugin.days = new Map();
-        this.plugin.saveDayCache();
-      }
-      if (this.plugin.auth.signedIn || e.expired) this.error = e.message;
+      // Shown only on the day it belongs to; an expired sign-in shows anyway.
+      if ((this.plugin.auth.signedIn && this.day === day) || e.expired) this.error = e.message;
     } finally {
       this.loading = false;
       this.render();
@@ -549,18 +567,19 @@ class CalendarPanelView extends ItemView {
       this.titleEl.setText(this.day === today ? `Today · ${longDate(this.day)}` : longDate(this.day));
       this.todayEl.toggleClass("is-hidden", this.day === today);
     }
+    if (!this.ready) return;
     this.renderStatus();
     if (!this.listEl) return;
     this.listEl.empty();
     if (!this.plugin.auth.signedIn) return;
     const entry = this.plugin.dayCache().get(this.day);
+    this.nowKey = this.timeStates();
     if (!entry) return;
     const events = this.plugin.visibleEvents(dayEvents(entry.events, this.day));
     if (!events.length) {
       this.listEl.createDiv({ cls: "oc-empty", text: "No events" });
       return;
     }
-    this.nowKey = this.timeStates();
     const now = Date.now();
     for (const event of events) this.renderRow(event, now);
   }
@@ -718,6 +737,8 @@ class CalendarSettingTab extends PluginSettingTab {
           if (value === s[key]) return;
           const wasSignedIn = auth.signedIn;
           s[key] = value;
+          // The sign-in dialog's remembered IDs would otherwise undo this.
+          if (this.plugin.signInDraft && key in this.plugin.signInDraft) this.plugin.signInDraft[key] = value;
           await this.plugin.saveSettings();
           if (wasSignedIn && !auth.matchesSettings()) this.plugin.signOut();
         });
@@ -1098,6 +1119,7 @@ class MicrosoftAuth {
     const error = res.json && res.json.error;
     if (error === "invalid_grant" || error === "interaction_required" || error === "invalid_client") {
       this.signOut();
+      this.plugin.sessionEnded();
       const expired = new NotSignedInError(`Your Microsoft sign-in has expired. Sign in again. (${describeAuthError(res.json)})`);
       expired.expired = true;
       throw expired;
@@ -1129,7 +1151,8 @@ class SignInModal extends Modal {
   askForApp() {
     const { contentEl } = this;
     const s = this.plugin.settings;
-    const draft = this.plugin.signInDraft || (this.plugin.signInDraft = { clientId: s.clientId.trim(), tenant: s.tenant || "common" });
+    const draft = this.plugin.signInDraft || (this.plugin.signInDraft = { clientId: s.clientId.trim(), tenant: this.plugin.auth.tenant() });
+    let started = false;
     contentEl.createDiv({
       cls: "oc-signin-status",
       text: "Enter the IDs of the app you registered in Microsoft Entra. The plugin's README explains how to register one.",
@@ -1152,13 +1175,22 @@ class SignInModal extends Modal {
         .setButtonText("Continue")
         .setCta()
         .onClick(async () => {
+          if (started) return;
           if (!draft.clientId) {
             new Notice("Enter the client ID.");
             return;
           }
+          started = true;
           s.clientId = draft.clientId;
           s.tenant = draft.tenant || "common";
-          await this.plugin.saveSettings();
+          try {
+            await this.plugin.saveSettings();
+          } catch (e) {
+            started = false;
+            new Notice(`Could not save the IDs: ${e.message}`);
+            return;
+          }
+          this.plugin.refreshSettingTab();
           contentEl.empty();
           this.startSignIn();
         })
@@ -1172,8 +1204,7 @@ class SignInModal extends Modal {
     try {
       flow = await this.plugin.auth.startDeviceFlow();
     } catch (e) {
-      status.setText(`Could not start sign-in: ${e.message}`);
-      status.addClass("oc-error");
+      if (!this.cancel.cancelled) this.failed(status, `Could not start sign-in: ${e.message}`);
       return;
     }
     if (this.cancel.cancelled) return;
@@ -1203,11 +1234,22 @@ class SignInModal extends Modal {
       this.plugin.signedIn();
     } catch (e) {
       if (this.cancel.cancelled) return;
-      status.setText(e.message);
-      status.addClass("oc-error");
       codeRow.remove();
       actions.remove();
+      this.failed(status, e.message);
     }
+  }
+
+  // A failed sign-in can go back to the IDs, which are often what was wrong.
+  failed(status, message) {
+    status.setText(message);
+    status.addClass("oc-error");
+    new Setting(this.contentEl).addButton((button) =>
+      button.setButtonText("Back").onClick(() => {
+        this.contentEl.empty();
+        this.askForApp();
+      })
+    );
   }
 
   onClose() {
