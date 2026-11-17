@@ -1115,38 +1115,49 @@ class SignInModal extends Modal {
 
   async onOpen() {
     this.setTitle("Sign in to Microsoft");
-    if (!this.plugin.settings.clientId.trim()) this.askForApp();
-    else this.startSignIn();
+    // Signing in means leaving for a browser and coming back. A click on
+    // the dimmed background on return would close the dialog and lose what
+    // was typed, so only Escape and the close button close it.
+    const bg = this.containerEl.querySelector(".modal-bg");
+    if (bg) bg.addEventListener("click", (evt) => evt.stopImmediatePropagation(), true);
+    this.askForApp();
   }
 
+  // The app registration's IDs, filled in with what was entered last, so
+  // the order they are typed in never matters and a closed dialog loses
+  // nothing.
   askForApp() {
     const { contentEl } = this;
     const s = this.plugin.settings;
+    const draft = this.plugin.signInDraft || (this.plugin.signInDraft = { clientId: s.clientId.trim(), tenant: s.tenant || "common" });
     contentEl.createDiv({
       cls: "oc-signin-status",
       text: "Enter the IDs of the app you registered in Microsoft Entra. The plugin's README explains how to register one.",
     });
-    let clientId = "";
-    let tenant = s.tenant || "common";
     new Setting(contentEl)
       .setName("Client ID")
       .setDesc("Application (client) ID")
-      .addText((text) => text.setPlaceholder("00000000-0000-0000-0000-000000000000").onChange((v) => (clientId = v.trim())));
+      .addText((text) =>
+        text
+          .setPlaceholder("00000000-0000-0000-0000-000000000000")
+          .setValue(draft.clientId)
+          .onChange((v) => (draft.clientId = v.trim()))
+      );
     new Setting(contentEl)
       .setName("Tenant")
       .setDesc("Directory (tenant) ID for an app limited to your organisation; otherwise common or consumers.")
-      .addText((text) => text.setValue(tenant).onChange((v) => (tenant = v.trim())));
+      .addText((text) => text.setPlaceholder("common").setValue(draft.tenant).onChange((v) => (draft.tenant = v.trim())));
     new Setting(contentEl).addButton((button) =>
       button
         .setButtonText("Continue")
         .setCta()
         .onClick(async () => {
-          if (!clientId) {
+          if (!draft.clientId) {
             new Notice("Enter the client ID.");
             return;
           }
-          s.clientId = clientId;
-          s.tenant = tenant || "common";
+          s.clientId = draft.clientId;
+          s.tenant = draft.tenant || "common";
           await this.plugin.saveSettings();
           contentEl.empty();
           this.startSignIn();
@@ -1187,6 +1198,7 @@ class SignInModal extends Modal {
     try {
       await this.plugin.auth.completeDeviceFlow(flow, this.cancel);
       if (this.cancel.cancelled) return;
+      this.plugin.signInDraft = null;
       this.close();
       this.plugin.signedIn();
     } catch (e) {
