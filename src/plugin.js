@@ -53,6 +53,9 @@ const DEFAULT_SETTINGS = {
   dailyNoteFormat: "YYYY-MM-DD",
   followDailyNote: true,
   showDeclined: false,
+  // The calendars to show, as { id, name, color }; empty shows the default
+  // calendar only.
+  calendars: [],
   refreshMinutes: 15,
 };
 
@@ -166,6 +169,7 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
 
   signOut() {
     this.auth.signOut();
+    this.calendarList = null;
     this.days = new Map();
     this.saveDayCache();
     this.panels().forEach((view) => view.clear());
@@ -175,6 +179,7 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
 
   // The sign-in expired: forget its events, as signing out does.
   sessionEnded() {
+    this.calendarList = null;
     this.days = new Map();
     this.saveDayCache();
     this.refreshSettingTab();
@@ -183,6 +188,7 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
   signedIn() {
     const who = this.auth.account ? ` as ${this.auth.account}` : "";
     new Notice(`Signed in to Microsoft${who}.`);
+    this.calendarList = null;
     this.days = new Map();
     this.panels().forEach((view) => view.refresh(true));
     this.refreshSettingTab();
@@ -206,6 +212,8 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
     try {
       const cached = this.app.loadLocalStorage(EVENT_CACHE_KEY);
       if (!cached || !cached.days || !this.auth.signedIn || cached.account !== this.auth.account) return new Map();
+      // Days fetched for another choice of calendars do not count.
+      if (cached.calendars !== this.calendarKey()) return new Map();
       return new Map(Object.entries(cached.days));
     } catch (_) {
       return new Map();
@@ -219,21 +227,57 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
         .slice(0, CACHED_DAYS);
       this.app.saveLocalStorage(
         EVENT_CACHE_KEY,
-        days.length ? { account: this.auth.account, days: Object.fromEntries(days) } : null
+        days.length ? { account: this.auth.account, calendars: this.calendarKey(), days: Object.fromEntries(days) } : null
       );
     } catch (_) {
       // A full or unavailable local storage only costs the instant start.
     }
   }
 
-  // Fetches a day's events from Microsoft Graph and keeps them.
+  // The chosen calendars, for the account they were chosen with only.
+  calendars() {
+    const s = this.settings;
+    if (!Array.isArray(s.calendars) || s.calendarsAccount !== this.auth.account) return [];
+    return s.calendars.filter((c) => c && c.id);
+  }
+
+  calendarKey() {
+    return this.calendars().map((c) => c.id).join(",");
+  }
+
+  // A new choice of calendars: what was fetched for the old one is dropped.
+  async setCalendars(calendars) {
+    this.settings.calendars = calendars;
+    this.settings.calendarsAccount = this.auth.account;
+    await this.saveSettings();
+    this.days = new Map();
+    this.saveDayCache();
+    this.panels().forEach((view) => view.refresh(true));
+  }
+
+  // The user's calendars, for the settings tab, fetched once per session.
+  listCalendars(force = false) {
+    if (!this.calendarList || force) {
+      this.calendarList = fetchCalendars(this.auth).catch((e) => {
+        this.calendarList = null;
+        throw e;
+      });
+    }
+    return this.calendarList;
+  }
+
+  // Fetches a day's events from Microsoft Graph and keeps them, with the
+  // calendars that could not be read.
   async loadDay(day) {
     const auth = this.auth;
     const epoch = auth.epoch;
-    const events = await fetchDayEvents(auth, day);
+    const key = this.calendarKey();
+    const { events, failures } = await fetchDayEvents(auth, day, this.calendars());
     // Signed out, or into another account, while this was loading.
     if (auth.epoch !== epoch) throw new NotSignedInError("Not signed in to Microsoft.");
-    this.dayCache().set(day, { events, fetchedAt: Date.now() });
+    // Other calendars were chosen meanwhile; these are for the old choice.
+    if (key !== this.calendarKey()) return events;
+    this.dayCache().set(day, { events, failures, fetchedAt: Date.now() });
     this.saveDayCache();
     return events;
   }
@@ -276,6 +320,7 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
       organizer: event.organizer || "",
       link: event.webLink || "",
       join: event.joinUrl || "",
+      calendar: event.calendar || "",
     };
     return fill(this.settings.template, values)
       .replace(/[ \t]{2,}/g, " ")
@@ -557,7 +602,10 @@ class CalendarPanelView extends ItemView {
       this.statusEl.createDiv({ cls: "oc-error", text: this.error });
     } else if (entry) {
       const time = new Date(entry.fetchedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-      this.statusEl.setText(`Updated ${time} · drag an event into a note, or use +`);
+      this.statusEl.createDiv({ text: `Updated ${time} · drag an event into a note, or use +` });
+      for (const f of entry.failures || []) {
+        this.statusEl.createDiv({ cls: "oc-error", text: `Could not read ${f.name}: ${f.message}` });
+      }
     }
   }
 
@@ -591,6 +639,7 @@ class CalendarPanelView extends ItemView {
     else if (event.end === event.start ? event.start < now : event.end <= now) row.addClass("is-past");
     else if (event.start <= now && now < event.end) row.addClass("is-now");
     if (event.showAs) row.addClass(`is-${event.showAs}`);
+    if (event.color) setCssProps(row, { "--oc-calendar-color": event.color });
     if (event.response === "declined") row.addClass("is-declined");
 
     row.createDiv({ cls: "oc-time", text: this.plugin.timeLabel(event, day) });
@@ -598,6 +647,7 @@ class CalendarPanelView extends ItemView {
     body.createDiv({ cls: "oc-subject", text: event.title });
     const meta = body.createDiv({ cls: "oc-meta" });
     if (event.location) meta.createSpan({ cls: "oc-location", text: event.location });
+    if (event.calendar && this.plugin.calendars().length > 1) meta.createSpan({ cls: "oc-calendar", text: event.calendar });
     if (event.showAs === "tentative" || event.response === "tentativelyAccepted") meta.createSpan({ text: "Tentative" });
     if (event.response === "notResponded") meta.createSpan({ cls: "oc-unanswered", text: "Not answered" });
     if (event.joinUrl) {
@@ -667,10 +717,12 @@ class CalendarSettingTab extends PluginSettingTab {
     this.text(
       containerEl,
       "Event template",
-      "What an added event becomes. Placeholders: {{time}}, {{start}}, {{end}}, {{title}}, {{date}}, {{location}}, {{organizer}}, {{link}}, {{join}}.",
+      "What an added event becomes. Placeholders: {{time}}, {{start}}, {{end}}, {{title}}, {{date}}, {{location}}, {{organizer}}, {{calendar}}, {{link}}, {{join}}.",
       "template",
       () => this.plugin.panels().forEach((view) => view.render())
     );
+
+    if (auth.signedIn) this.calendarSettings(containerEl);
 
     const advanced = containerEl.createEl("details", { cls: "oc-advanced" });
     advanced.createEl("summary", { text: "Advanced" });
@@ -712,10 +764,56 @@ class CalendarSettingTab extends PluginSettingTab {
     this.authText(
       advanced,
       "Permissions",
-      "Microsoft Graph permissions to ask for. Calendars.Read is enough.",
+      "Microsoft Graph permissions to ask for. Calendars.Read covers your own calendars; add Calendars.Read.Shared if a calendar shared with you cannot be read.",
       "scopes",
       "Calendars.Read"
     );
+  }
+
+  // A toggle per calendar, filled in once Microsoft has listed them. Only
+  // fetched while the settings tab is open.
+  calendarSettings(el) {
+    new Setting(el)
+      .setName("Calendars")
+      .setDesc("Which calendars the panel shows. With none chosen, it shows your default calendar.")
+      .setHeading();
+    const list = el.createDiv({ cls: "oc-calendar-list" });
+    const status = list.createDiv({ cls: "setting-item-description", text: "Loading your calendars…" });
+    const tab = this;
+    this.plugin
+      .listCalendars()
+      .then((calendars) => {
+        if (list.isConnected === false) return;
+        status.remove();
+        const chosen = () => {
+          const ids = tab.plugin.calendars().map((c) => c.id);
+          return ids.length ? ids : calendars.filter((c) => c.isDefault).map((c) => c.id);
+        };
+        for (const calendar of calendars) {
+          const setting = new Setting(list).setName(calendar.name);
+          if (calendar.owner) setting.setDesc(calendar.owner);
+          if (calendar.color) setCssProps(setting.nameEl, { "--oc-calendar-color": calendar.color });
+          setting.nameEl.addClass("oc-calendar-name");
+          setting.addToggle((toggle) =>
+            toggle.setValue(chosen().includes(calendar.id)).onChange(async (on) => {
+              const ids = new Set(chosen());
+              if (on) ids.add(calendar.id);
+              else ids.delete(calendar.id);
+              const next = calendars
+                .filter((c) => ids.has(c.id))
+                .map((c) => ({ id: c.id, name: c.name, color: c.color }));
+              // Only the default calendar is the same as none chosen.
+              const onlyDefault = next.length === 1 && calendars.find((c) => c.id === next[0].id).isDefault;
+              await tab.plugin.setCalendars(next.length === 0 || onlyDefault ? [] : next);
+              if (!next.length) toggle.setValue(chosen().includes(calendar.id));
+            })
+          );
+        }
+      })
+      .catch((e) => {
+        status.setText(`Could not list your calendars: ${e.message}`);
+        status.addClass("oc-error");
+      });
   }
 
   appSettings(el) {
@@ -832,7 +930,7 @@ function safeUrl(url) {
   return typeof url === "string" && /^https:\/\//i.test(url) ? url : "";
 }
 
-function eventView(event) {
+function eventView(event, calendar) {
   const allDay = Boolean(event.isAllDay);
   const view = {
     id: event.id,
@@ -845,6 +943,8 @@ function eventView(event) {
     organizer: (event.organizer && event.organizer.emailAddress && event.organizer.emailAddress.name) || "",
     preview: (event.bodyPreview || "").trim(),
     webLink: safeUrl(event.webLink),
+    calendar: (calendar && calendar.name) || "",
+    color: (calendar && calendar.color) || "",
     joinUrl: safeUrl((event.onlineMeeting && event.onlineMeeting.joinUrl) || event.onlineMeetingUrl),
   };
   if (allDay) {
@@ -859,8 +959,11 @@ function eventView(event) {
   return view;
 }
 
-// The events of a local day, from the signed-in user's default calendar.
-async function fetchDayEvents(auth, day) {
+// The events of a local day from the chosen calendars (the default one when
+// none are chosen), as { events, failures }. A calendar that cannot be read
+// is listed in failures and the others still show; when none can be read,
+// the first error is thrown.
+async function fetchDayEvents(auth, day, calendars = []) {
   const { start, end } = dayBounds(day);
   const params = [
     `startDateTime=${encodeURIComponent(new Date(start).toISOString())}`,
@@ -869,10 +972,85 @@ async function fetchDayEvents(auth, day) {
     "$orderby=start/dateTime",
     "$top=100",
   ].join("&");
-  const items = await graphGetAll(auth, `${GRAPH}/me/calendarView?${params}`);
   // The UTC window can catch a neighbouring day's all-day events; keep the
   // ones on this day.
-  return dayEvents(items.map(eventView).filter((e) => e.allDay ? e.startDate : !Number.isNaN(e.start)), day);
+  const onDay = (items, calendar) =>
+    dayEvents(items.map((item) => eventView(item, calendar)).filter((e) => (e.allDay ? e.startDate : !Number.isNaN(e.start))), day);
+  if (!calendars.length) {
+    return { events: onDay(await graphGetAll(auth, `${GRAPH}/me/calendarView?${params}`), null), failures: [] };
+  }
+  // One token up front, so parallel requests do not each try to refresh.
+  await auth.accessToken();
+  const results = await mapLimit(calendars, GRAPH_MAX_CONCURRENT, (calendar) =>
+    graphGetAll(auth, `${GRAPH}/me/calendars/${encodeURIComponent(calendar.id)}/calendarView?${params}`).then(
+      (items) => ({ events: onDay(items, calendar) }),
+      (error) => ({ error })
+    )
+  );
+  const failed = results.filter((r) => r.error);
+  if (failed.length === results.length) throw failed[0].error;
+  return {
+    events: dayEvents(results.flatMap((r) => r.events || []), day),
+    failures: results.flatMap((r, i) => (r.error ? [{ name: calendars[i].name, message: r.error.message }] : [])),
+  };
+}
+
+// The user's calendars: their own and the ones shared with them, default
+// first, as { id, name, color, owner, isDefault }.
+async function fetchCalendars(auth) {
+  const items = await graphGetAll(auth, `${GRAPH}/me/calendars?$select=id,name,color,hexColor,isDefaultCalendar,owner,canEdit&$top=100`);
+  const me = (auth.account || "").toLowerCase();
+  return items
+    .map((c) => {
+      const owner = c.owner && (c.owner.address || "").toLowerCase() !== me ? c.owner.name || c.owner.address || "" : "";
+      return {
+        id: c.id,
+        name: c.name || "(No name)",
+        color: calendarColor(c),
+        owner: owner ? `Shared by ${owner}` : "",
+        isDefault: Boolean(c.isDefaultCalendar),
+      };
+    })
+    .sort((a, b) => b.isDefault - a.isDefault);
+}
+
+// Outlook's colour for a calendar: its hex colour, or one close to its
+// named colour, or none (the theme's accent).
+const CALENDAR_COLORS = {
+  lightBlue: "#4f9fe6",
+  lightGreen: "#5cb85c",
+  lightOrange: "#f0a35e",
+  lightGray: "#a0a0a0",
+  lightYellow: "#e6c84f",
+  lightTeal: "#4cc2c4",
+  lightPink: "#e57eb5",
+  lightBrown: "#b08b6e",
+  lightRed: "#e06666",
+};
+
+function calendarColor(calendar) {
+  if (/^#[0-9a-f]{6}$/i.test(calendar.hexColor || "")) return calendar.hexColor;
+  return CALENDAR_COLORS[calendar.color] || "";
+}
+
+// Sets CSS custom properties, through Obsidian's helper where it exists.
+function setCssProps(el, props) {
+  if (typeof el.setCssProps === "function") el.setCssProps(props);
+  else if (el.style && el.style.setProperty) for (const [key, value] of Object.entries(props)) el.style.setProperty(key, value);
+}
+
+// Runs fn over items with at most `limit` in flight, keeping results in order.
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
 }
 
 // ── small helpers ────────────────────────────────────────────────────────────
@@ -1262,6 +1440,7 @@ class SignInModal extends Modal {
 // ── Microsoft Graph ──────────────────────────────────────────────────────────
 
 const GRAPH_MAX_RETRIES = 5;
+const GRAPH_MAX_CONCURRENT = 3;
 
 async function graphGet(auth, url) {
   let token = await auth.accessToken();

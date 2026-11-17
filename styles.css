@@ -49,7 +49,7 @@
   gap: var(--size-4-2);
   align-items: flex-start;
   padding: var(--size-4-2);
-  border-left: 3px solid var(--interactive-accent);
+  border-left: 3px solid var(--oc-calendar-color, var(--interactive-accent));
   border-radius: var(--radius-s);
   cursor: grab;
   user-select: none;
@@ -239,4 +239,19 @@
   padding: var(--size-4-2) 0;
   font-weight: var(--font-semibold);
   color: var(--text-muted);
+}
+
+.oc-calendar {
+  color: var(--text-faint);
+}
+
+/* Settings: a dot in each calendar's colour before its name. */
+.oc-calendar-name::before {
+  content: "";
+  display: inline-block;
+  width: 0.7em;
+  height: 0.7em;
+  margin-right: var(--size-4-2);
+  border-radius: 50%;
+  background: var(--oc-calendar-color, var(--interactive-accent));
 }

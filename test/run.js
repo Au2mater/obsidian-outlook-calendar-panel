@@ -290,7 +290,8 @@ test("reads a local day: window, UTC header, paging, 401 retry and mapping", asy
     }
     return { body: { value: [graphEvent("a", "Standup", "2026-11-17T08:00:00", "2026-11-17T08:15:00", { webLink: "javascript:alert(1)" })] } };
   };
-  const events = await fetchDayEvents(plugin.auth, "2026-11-17");
+  const { events, failures } = await fetchDayEvents(plugin.auth, "2026-11-17");
+  assert.deepStrictEqual(failures, []);
   const first = global.__requests.find((r) => r.url.includes("calendarView"));
   assert.ok(first.url.includes("startDateTime=2026-11-16T23%3A00%3A00.000Z"));
   assert.ok(first.url.includes("endDateTime=2026-11-17T23%3A00%3A00.000Z"));
@@ -303,6 +304,68 @@ test("reads a local day: window, UTC header, paging, 401 retry and mapping", asy
   assert.strictEqual(events.find((e) => e.id === "a").webLink, "", "only https links are kept");
   assert.deepStrictEqual(plugin.visibleEvents(events).map((e) => e.id), ["a", "b"], "cancelled events are hidden");
   assert.strictEqual(plugin.timeLabel(lunch, "2026-11-17"), "12:00–13:00", "shown in local time");
+});
+
+test("chosen calendars are read one by one, and one that fails does not hide the others", async () => {
+  const plugin = await signedInPlugin();
+  global.__handler = (req) => {
+    if (req.url.includes("/calendars/work/")) return { body: { value: [graphEvent("w", "Standup", "2026-11-17T08:00:00", "2026-11-17T08:15:00")] } };
+    if (req.url.includes("/calendars/home/")) return { body: { value: [graphEvent("h", "Dentist", "2026-11-17T07:00:00", "2026-11-17T07:30:00")] } };
+    return { status: 403, body: { error: { message: "Access is denied." } } };
+  };
+  const calendars = [
+    { id: "work", name: "Work", color: "#4f9fe6" },
+    { id: "home", name: "Home", color: "" },
+    { id: "shared", name: "Ann's calendar", color: "" },
+  ];
+  await plugin.setCalendars(calendars);
+  const events = await plugin.loadDay("2026-11-17");
+  assert.deepStrictEqual(events.map((e) => [e.id, e.calendar]), [["h", "Home"], ["w", "Work"]], "merged and sorted by start");
+  assert.strictEqual(events[1].color, "#4f9fe6");
+  const entry = plugin.dayCache().get("2026-11-17");
+  assert.deepStrictEqual(entry.failures.map((f) => f.name), ["Ann's calendar"]);
+  assert.match(entry.failures[0].message, /Access is denied/);
+  plugin.settings.template = "- {{time}} {{title}} ({{calendar}})";
+  assert.strictEqual(plugin.renderEvent(events[0], "2026-11-17"), "- 08:00–08:30 Dentist (Home)");
+  // All of them failing is an error.
+  global.__handler = () => ({ status: 403, body: { error: { message: "Access is denied." } } });
+  await assert.rejects(plugin.loadDay("2026-11-18"), /Access is denied/);
+});
+
+test("choosing other calendars drops the days fetched for the old choice", async () => {
+  const plugin = await signedInPlugin();
+  global.__handler = () => ({ body: { value: [] } });
+  await plugin.loadDay("2026-11-17");
+  assert.strictEqual(plugin.dayCache().size, 1);
+  await plugin.setCalendars([{ id: "work", name: "Work" }]);
+  assert.strictEqual(plugin.dayCache().size, 0);
+  await plugin.loadDay("2026-11-17");
+  // A start with another choice saved ignores the stored days.
+  plugin.days = null;
+  plugin.settings.calendars = [];
+  assert.strictEqual(plugin.dayCache().size, 0);
+  // Calendars chosen with another account are not used.
+  plugin.settings.calendars = [{ id: "work", name: "Work" }];
+  plugin.settings.calendarsAccount = "someone@else.com";
+  assert.deepStrictEqual(plugin.calendars(), []);
+});
+
+test("the calendar list comes back default first, with owners and colours", async () => {
+  const plugin = await signedInPlugin();
+  global.__handler = () => ({
+    body: {
+      value: [
+        { id: "b", name: "Ann's calendar", color: "lightGreen", hexColor: "", owner: { name: "Ann", address: "ann@example.com" } },
+        { id: "a", name: "Calendar", color: "auto", hexColor: "#123abc", isDefaultCalendar: true, owner: { name: "Me", address: "USER@example.com" } },
+      ],
+    },
+  });
+  const list = await plugin.listCalendars();
+  assert.deepStrictEqual(list.map((c) => [c.id, c.color, c.owner, c.isDefault]), [
+    ["a", "#123abc", "", true],
+    ["b", "#5cb85c", "Shared by Ann", false],
+  ]);
+  assert.ok(global.__requests[0].url.includes("/me/calendars?"));
 });
 
 test("a day that leaves summer time is 25 hours long", async () => {

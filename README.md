@@ -133,7 +133,7 @@ rest is under **Advanced**, collapsed.
 | --- | --- | --- |
 | Client ID | empty | From your app registration. |
 | Tenant | `common` | Tenant ID, `common`, `organizations` or `consumers`. |
-| Event template | `- {{time}} {{title}}` | `{{time}}`, `{{start}}`, `{{end}}`, `{{title}}`, `{{date}}`, `{{location}}`, `{{organizer}}`, `{{link}}`, `{{join}}` |
+| Event template | `- {{time}} {{title}}` | `{{time}}`, `{{start}}`, `{{end}}`, `{{title}}`, `{{date}}`, `{{location}}`, `{{organizer}}`, `{{calendar}}`, `{{link}}`, `{{join}}` |
 | Time format (advanced) | `HH:mm` | Moment.js format, such as `h:mm A`. |
 | Daily note date format (advanced) | `YYYY-MM-DD` | Moment.js format of daily note file names. |
 | Follow the daily note (advanced) | on | Show the day of the daily note you open. |
@@ -146,7 +146,18 @@ rest is under **Advanced**, collapsed.
 meeting link. Placeholders with nothing to fill in disappear, with the spaces
 around them.
 
-The panel shows your default calendar only.
+### Calendars
+
+The panel shows your default calendar until you choose others under
+**Calendars** in the settings, which lists your own calendars and the ones
+shared with you, each with its Outlook colour. Events show a stripe in their
+calendar's colour, and with more than one calendar chosen, the calendar's
+name. A calendar that cannot be read is named above the events, and the
+others still show.
+
+Calendars shared with you by someone else may need the **Calendars.Read.Shared**
+permission: add it to the app registration and to **Permissions** under
+Advanced, then sign in again.
 
 ## Development
 
