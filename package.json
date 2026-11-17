@@ -1,0 +1,11 @@
+{
+  "name": "obsidian-outlook-calendar-panel",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build.js",
+    "test": "node test/run.js"
+  },
+  "version": "1.0.0",
+  "description": "Obsidian plugin: a day of your Outlook calendar in a sidebar, with events you can drag into notes.",
+  "license": "MIT"
+}

@@ -1,0 +1,242 @@
+.oc-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-2);
+  padding: var(--size-4-2);
+}
+
+/* ‹ Today · Tue 17 Nov › [Today] [refresh] */
+.oc-nav {
+  display: flex;
+  gap: var(--size-4-1);
+  align-items: center;
+}
+
+.oc-title {
+  flex: 1;
+  min-width: 0;
+  text-align: center;
+  font-weight: var(--font-semibold);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.oc-today.is-hidden {
+  display: none;
+}
+
+.oc-status {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+
+.oc-error {
+  font-size: var(--font-ui-small);
+  color: var(--text-error);
+  white-space: pre-wrap;
+}
+
+.oc-empty {
+  padding: var(--size-4-2);
+  font-size: var(--font-ui-small);
+  color: var(--text-faint);
+}
+
+/* One event: time on the left, subject and details beside it. */
+.oc-event {
+  display: flex;
+  gap: var(--size-4-2);
+  align-items: flex-start;
+  padding: var(--size-4-2);
+  border-left: 3px solid var(--interactive-accent);
+  border-radius: var(--radius-s);
+  cursor: grab;
+  user-select: none;
+}
+
+.oc-event + .oc-event {
+  margin-top: 2px;
+}
+
+.oc-event:hover {
+  background: var(--background-modifier-hover);
+}
+
+.oc-event.is-dragging {
+  opacity: 0.5;
+}
+
+.oc-event.is-all-day {
+  background: var(--background-secondary-alt);
+}
+
+.oc-event.is-now {
+  background: color-mix(in srgb, var(--interactive-accent) 12%, transparent);
+}
+
+.oc-event.is-past {
+  opacity: 0.55;
+}
+
+.oc-event.is-tentative,
+.oc-event.is-free {
+  border-left-style: dashed;
+}
+
+.oc-event.is-declined .oc-subject {
+  text-decoration: line-through;
+  color: var(--text-faint);
+}
+
+.oc-time {
+  flex: none;
+  width: 6.5em;
+  font-size: var(--font-ui-smaller);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+.oc-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.oc-subject {
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.oc-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-4-1) var(--size-4-3);
+  margin-top: 2px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+
+.oc-meta:empty {
+  display: none;
+}
+
+.oc-location {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.oc-unanswered {
+  color: var(--text-warning, var(--text-accent));
+}
+
+.oc-join {
+  font-weight: var(--font-semibold);
+}
+
+/* Shown when the event is clicked. */
+.oc-details {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-1);
+  margin-top: var(--size-4-1);
+  padding: var(--size-4-1) var(--size-4-2);
+  border-left: 2px solid var(--background-modifier-border);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  user-select: text;
+  cursor: text;
+}
+
+.oc-details.is-hidden,
+.oc-details:empty {
+  display: none;
+}
+
+.oc-preview {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The + button that adds an event to the note: faint until hovered. */
+.oc-add {
+  flex: none;
+  align-self: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-s);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-faint);
+  opacity: 0.4;
+  cursor: pointer;
+}
+
+.oc-add svg {
+  width: 14px;
+  height: 14px;
+}
+
+.oc-event:hover .oc-add,
+.oc-add:focus-visible {
+  opacity: 1;
+  color: var(--text-muted);
+}
+
+.oc-add:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+}
+
+/* Signed-out panel and the sign-in dialog. */
+.oc-signin {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-2);
+  align-items: flex-start;
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+}
+
+.oc-signin-code {
+  margin: var(--size-4-4) 0;
+  text-align: center;
+}
+
+.oc-signin-code code {
+  font-size: 1.8em;
+  letter-spacing: 0.15em;
+  padding: var(--size-4-2) var(--size-4-4);
+  user-select: all;
+}
+
+.oc-signin-actions {
+  display: flex;
+  gap: var(--size-4-2);
+  justify-content: center;
+}
+
+.oc-signin-hint {
+  margin-top: var(--size-4-2);
+  text-align: center;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+}
+
+.oc-advanced {
+  margin-top: var(--size-4-4);
+}
+
+.oc-advanced > summary {
+  cursor: pointer;
+  padding: var(--size-4-2) 0;
+  font-weight: var(--font-semibold);
+  color: var(--text-muted);
+}
