@@ -39,6 +39,9 @@ class Plugin {
     };
   }
   registerEvent() {}
+  registerEditorExtension(extension) {
+    global.__editorExtension = extension;
+  }
   registerInterval(id) {
     clearInterval(id);
     return id;
@@ -94,6 +97,8 @@ module.exports = {
   Plugin,
   PluginSettingTab: Stub,
   Setting: Stub,
+  // What the editor knows about its note; the fake views below carry the file.
+  editorInfoField: { name: "editorInfoField" },
   setIcon() {},
   moment,
   async requestUrl(req) {

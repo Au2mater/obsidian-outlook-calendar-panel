@@ -8,23 +8,40 @@ const Module = require("module");
 const path = require("path");
 
 const stubPath = path.join(__dirname, "obsidian-stub.js");
+const codemirrorStubPath = path.join(__dirname, "codemirror-stub.js");
 const realResolve = Module._resolveFilename;
 Module._resolveFilename = function (request, ...rest) {
-  return request === "obsidian" ? stubPath : realResolve.call(this, request, ...rest);
+  if (request === "obsidian") return stubPath;
+  if (request === "@codemirror/view" || request === "@codemirror/state") return codemirrorStubPath;
+  return realResolve.call(this, request, ...rest);
 };
 const mainPath = path.join(__dirname, "..", "src", "plugin.js");
 const source =
   fs.readFileSync(mainPath, "utf8") +
-  "\nmodule.exports.__internals = { MicrosoftAuth, fetchDayEvents, eventView, dayEvents, dayBounds, addDays, placeOnOwnLine, insertOnOwnLine, describeAuthError, localToday };\n";
+  "\nmodule.exports.__internals = { MicrosoftAuth, fetchDayEvents, eventView, dayEvents, dayBounds, addDays, placeOnOwnLine, insertOnOwnLine, describeAuthError, localToday, lineKeys, eventKeys, noteLineKeys, buildEventIndex, eventKeyForLine };\n";
 const mod = new Module(mainPath, module);
 mod.filename = mainPath;
 mod.paths = Module._nodeModulePaths(path.dirname(mainPath));
 mod._compile(source, mainPath);
 const CalendarPlugin = mod.exports;
-const { fetchDayEvents, eventView, dayEvents, dayBounds, addDays, placeOnOwnLine, insertOnOwnLine, describeAuthError, localToday } =
-  CalendarPlugin.__internals;
+const {
+  fetchDayEvents,
+  eventView,
+  dayEvents,
+  dayBounds,
+  addDays,
+  placeOnOwnLine,
+  insertOnOwnLine,
+  describeAuthError,
+  localToday,
+  lineKeys,
+  eventKeys,
+  noteLineKeys,
+  buildEventIndex,
+  eventKeyForLine,
+} = CalendarPlugin.__internals;
 
-global.window = { setTimeout: (fn) => setImmediate(fn), clearTimeout() {}, setInterval, clearInterval };
+global.window = { setTimeout: (fn) => setImmediate(fn), clearTimeout: (id) => id && clearImmediate(id), setInterval, clearInterval };
 global.atob = global.atob || ((s) => Buffer.from(s, "base64").toString("binary"));
 
 const idToken = `h.${Buffer.from(JSON.stringify({ preferred_username: "user@example.com" })).toString("base64url")}.s`;
@@ -63,6 +80,8 @@ function el(tag = "div", opts = {}) {
     listeners: {},
     isConnected: true,
     isShown: () => node.shown !== false,
+    offsetWidth: 0,
+    scrollIntoView: (opts) => (node.scrolledTo = opts.block),
     empty() {
       node.children = [];
     },
@@ -579,6 +598,206 @@ test("several lines insert below an indented line with its indentation", () => {
   insertOnOwnLine(editor, "- a\n- b");
   assert.deepStrictEqual(text, ["  - Today", "  - a", "  - b"]);
   assert.deepStrictEqual(cursor, { line: 2, ch: 5 });
+});
+
+// ── links from note lines, and the events a note holds ──
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("a note line matches an event by its inserted line, or by its time and title", async () => {
+  const plugin = await signedInPlugin();
+  const standup = eventView(graphEvent("s", "Standup", "2026-11-17T08:00:00", "2026-11-17T08:15:00"));
+  const keys = plugin.eventKeys(standup, "2026-11-17");
+  const days = new Map([["2026-11-17", { events: [standup], fetchedAt: 1 }]]);
+  const index = buildEventIndex(days, plugin);
+  const match = (line) => eventKeyForLine(index, line);
+  assert.strictEqual(match("  - 09:00–09:15 Standup  "), "=- 09:00–09:15 Standup", "the inserted line, trimmed");
+  assert.strictEqual(match("* [ ] 09:00-09:15   STANDUP #meeting [Join](https://teams/x)"), keys[1], "case, dash, spaces and a tail of noise");
+  assert.strictEqual(match("1. 09:00 standup ✅ 2026-11-17"), keys[2], "the start time alone");
+  assert.strictEqual(match("- Standup"), null, "a title alone is not enough");
+  assert.strictEqual(match("09:00 Standup"), null, "not a list item");
+  assert.strictEqual(match(`- 09:00 Standup ${"x".repeat(2000)}`), null, "long lines are skipped");
+  // Runs of digits that could split into dates several ways stay fast.
+  for (const unit of ["12-12-12", "12.12.12", "1/1/1111/", "#a1/1/11"]) {
+    const started = Date.now();
+    match(`- 09:00 Standup ${unit.repeat(Math.floor(900 / unit.length))}!`);
+    assert.ok(Date.now() - started < 200, `no runaway backtracking on ${unit}`);
+  }
+  assert.deepStrictEqual(lineKeys("   "), []);
+  assert.deepStrictEqual(eventKeys("", "T", "", ""), []);
+  assert.strictEqual(eventKeys("- 09:00 T\n  Room 1", "T", "", "")[0], "=- 09:00 T", "a template of several lines matches by its first");
+  // The panel's "in the note" marks use the same keys.
+  const note = noteLineKeys("# Day\n- 9:00 nothing\n* [x] 09:00 Standup");
+  assert.ok(keys.some((key) => note.has(key)));
+  // A recurring event: one key, one candidate per day.
+  const next = eventView(graphEvent("s2", "Standup", "2026-11-18T08:00:00", "2026-11-18T08:15:00"));
+  days.set("2026-11-18", { events: [next], fetchedAt: 1 });
+  assert.deepStrictEqual(buildEventIndex(days, plugin).get(keys[1]), [{ id: "s", day: "2026-11-17" }, { id: "s2", day: "2026-11-18" }]);
+  assert.strictEqual(buildEventIndex(new Map(), plugin), null, "no events, no index");
+});
+
+// A fake CodeMirror view over lines of text, showing the given line ranges.
+function fakeEditorView(lines, visible, file = null) {
+  const starts = [];
+  let pos = 0;
+  for (const text of lines) {
+    starts.push(pos);
+    pos += text.length + 1;
+  }
+  const line = (n) => ({ number: n, from: starts[n - 1], to: starts[n - 1] + lines[n - 1].length, text: lines[n - 1] });
+  const doc = { lines: lines.length, line, lineAt: (p) => line(starts.filter((s) => s <= p).length) };
+  return {
+    state: { doc, field: () => ({ file }) },
+    visibleRanges: visible.map(([a, b]) => ({ from: line(a).from, to: line(b).to })),
+    dispatched: [],
+    dispatch(spec) {
+      this.dispatched.push(spec);
+    },
+  };
+}
+
+test("an editor opened at startup reads neither the sign-in nor the cache", async () => {
+  reset();
+  global.__data = { clientId: "client", tenant: "tenant" };
+  global.__handler = () => assert.fail("no request expected");
+  const plugin = new CalendarPlugin();
+  await plugin.onload();
+  const { cls } = global.__editorExtension;
+  const links = new cls(fakeEditorView(["- 09:00 Standup"], [[1, 1]]));
+  assert.deepStrictEqual(links.decorations, []);
+  assert.strictEqual(global.__secretReads, 0);
+  assert.strictEqual(global.__requests.length, 0);
+});
+
+test("the editor links cover visible event lines only, and redraw when events change", async () => {
+  const plugin = await signedInPlugin();
+  const { cls } = global.__editorExtension;
+  global.__handler = () => ({ body: { value: [graphEvent("a", "Standup", "2026-11-17T08:00:00", "2026-11-17T08:15:00"), graphEvent("b", "Lunch", "2026-11-17T11:00:00", "2026-11-17T12:00:00")] } });
+  await plugin.loadDay("2026-11-17");
+  const lines = ["- 09:00–09:15 Standup", "text", "- 12:00 Lunch", "- 09:00 standup", "- 12:00 Lunch"];
+  // Two visible ranges that share line 3; line 5 is off screen.
+  const view = fakeEditorView(lines, [[1, 3], [3, 4]]);
+  const links = new cls(view);
+  assert.deepStrictEqual(
+    links.decorations.map((d) => d.from),
+    [21, 40, 56]
+  );
+  const built = links.decorations;
+  links.update({ docChanged: false, viewportChanged: false, transactions: [{ effects: [] }] });
+  assert.strictEqual(links.decorations, built, "moving the cursor does not rebuild");
+  // New events: every open editor is told to redraw, once.
+  await tick();
+  view.dispatched = [];
+  global.__handler = () => ({ body: { value: [graphEvent("c", "Lunch", "2026-11-17T11:00:00", "2026-11-17T12:00:00")] } });
+  await plugin.loadDay("2026-11-17");
+  plugin.eventsChanged();
+  await tick();
+  assert.strictEqual(view.dispatched.length, 1);
+  links.update({ docChanged: false, viewportChanged: false, transactions: [{ effects: [view.dispatched[0].effects] }] });
+  assert.deepStrictEqual(links.decorations.map((d) => d.from), [40]);
+  links.destroy();
+  assert.strictEqual(plugin.eventLinkViews.size, 0);
+  // Signed out: no events, no links.
+  plugin.signOut();
+  assert.deepStrictEqual(new cls(view).decorations, []);
+});
+
+test("a link shows its event in a panel that is just opening, after the refresh", async () => {
+  const plugin = await signedInPlugin();
+  const event = (id, day) => graphEvent(id, "Standup", `${day}T08:00:00`, `${day}T08:15:00`);
+  for (const day of ["2026-11-17", "2026-11-18"]) {
+    global.__handler = () => ({ body: { value: [event(`s-${day}`, day)] } });
+    await plugin.loadDay(day);
+  }
+  // Both days are old now: showing one fetches it again.
+  for (const entry of plugin.dayCache().values()) entry.fetchedAt = 0;
+  const { cls } = global.__editorExtension;
+  const links = new cls(fakeEditorView(["- 09:00 Standup"], [[1, 1]], { basename: "2026-11-18" }));
+  const widget = links.decorations[0].value.spec.widget;
+
+  // The panel is closed: the link opens it.
+  let view;
+  plugin.app.workspace.getRightLeaf = () => ({
+    async setViewState() {
+      view = global.__viewFactory(this);
+      view.app = plugin.app;
+      view.contentEl = el();
+      this.view = view;
+      global.__leaves = [this];
+      await view.onOpen();
+    },
+  });
+  plugin.app.workspace.revealLeaf = async () => {};
+  let finish;
+  global.__handler = () => new Promise((resolve) => (finish = resolve));
+  await plugin.revealEvent(widget.key, "2026-11-18");
+  assert.strictEqual(view.day, "2026-11-18", "the note's own day wins");
+  assert.ok(view.pendingReveal, "nothing to flash before the panel has started");
+  global.__layoutReady();
+  await new Promise((r) => setTimeout(r, 10));
+  const row = () => view.listEl.find("oc-event")[0];
+  assert.ok(row().cls.has("is-revealed"), "the cached row flashes at once");
+  assert.ok(view.pendingReveal, "and again after the fetch");
+  finish({ body: { value: [event("s-2026-11-18", "2026-11-18")] } });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.ok(row().cls.has("is-revealed"), "the fetched row flashes");
+  assert.strictEqual(row().scrolledTo, "center");
+  assert.strictEqual(view.pendingReveal, null);
+  view.render();
+  assert.ok(!row().cls.has("is-revealed"), "a later render does not flash it again");
+
+  // An open panel moves to another day; without a note day, the panel's wins.
+  global.__handler = () => ({ body: { value: [event("s-2026-11-17", "2026-11-17")] } });
+  await plugin.revealEvent(widget.key, null);
+  assert.strictEqual(view.day, "2026-11-18");
+  view.setDay("2026-11-20", false);
+  await plugin.revealEvent(widget.key, "2026-11-17");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.strictEqual(view.day, "2026-11-17");
+  assert.ok(row().cls.has("is-revealed"));
+  global.__notices = [];
+  view.reveal("gone", "2026-11-17");
+  assert.deepStrictEqual(global.__notices, ["That event is no longer in your calendar."]);
+});
+
+test("the + button hides for events the active note holds, checked only while on screen", async () => {
+  const plugin = await signedInPlugin();
+  global.__handler = () => ({ body: { value: [graphEvent("a", "Standup", "2026-11-17T08:00:00", "2026-11-17T08:15:00"), graphEvent("b", "Lunch", "2026-11-17T11:00:00", "2026-11-17T12:00:00")] } });
+  let text = "# Today\n- 09:00–09:15 Standup";
+  let reads = 0;
+  const { MarkdownView } = require("./obsidian-stub.js");
+  const note = Object.assign(new MarkdownView(), { file: { path: "Note.md", basename: "Note" }, getViewData: () => (reads++, text) });
+  plugin.app.workspace.getActiveViewOfType = () => note;
+  plugin.settings.followDailyNote = false;
+  const view = await openView(plugin);
+  view.day = "2026-11-17";
+  global.__layoutReady();
+  await new Promise((r) => setTimeout(r, 10));
+  const inNote = () => view.listEl.find("oc-event").filter((r) => r.cls.has("is-in-note")).map((r) => r.ocEvent.id);
+  assert.deepStrictEqual(inNote(), ["a"]);
+  // Typing: one check per burst, and none when the note did not change.
+  text += "\n* 12:00 lunch";
+  plugin.scheduleNoteCheck(300);
+  plugin.scheduleNoteCheck(300);
+  await tick();
+  assert.deepStrictEqual(inNote(), ["a", "b"]);
+  const rows = view.listEl.find("oc-event");
+  plugin.scheduleNoteCheck(300);
+  await tick();
+  assert.strictEqual(view.listEl.find("oc-event")[0], rows[0], "unchanged note: nothing redrawn");
+  // Another day's daily note does not hold this day's events.
+  note.file = { path: "2026-11-10.md", basename: "2026-11-10" };
+  view.updateNoteMatches();
+  assert.deepStrictEqual(inNote(), []);
+  note.file = { path: "2026-11-17.md", basename: "2026-11-17" };
+  view.updateNoteMatches();
+  assert.deepStrictEqual(inNote(), ["a", "b"]);
+  // A panel that is not on screen does no work while typing.
+  view.contentEl.shown = false;
+  reads = 0;
+  plugin.scheduleNoteCheck(300);
+  await tick();
+  assert.strictEqual(reads, 0);
 });
 
 (async () => {

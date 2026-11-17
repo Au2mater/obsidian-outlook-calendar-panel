@@ -7,8 +7,11 @@
 // Startup cost is kept near zero on purpose: onload only registers things and
 // reads neither secret storage nor the network. A panel restored with the
 // workspace shows its cached events, and fetches only once the layout is
-// ready, the app is idle and the panel is on screen. There are no
-// per-keystroke listeners.
+// ready, the app is idle and the panel is on screen. The only work while
+// typing is one shared timer that, once typing pauses for 300 ms and only
+// while a panel is on screen, checks which events the active note holds; and
+// the editor's icons beside event lines, which look only at the lines on
+// screen.
 //
 // Plain JavaScript with no dependencies: `npm run build` checks this file and
 // writes it unchanged to main.js, the file Obsidian loads (see README.md).
@@ -23,8 +26,12 @@ const {
   Setting,
   moment,
   requestUrl,
+  editorInfoField,
   setIcon,
 } = require("obsidian");
+// Obsidian's own editor modules, for the links beside event lines in notes.
+const { Decoration, ViewPlugin, WidgetType } = require("@codemirror/view");
+const { RangeSetBuilder, StateEffect } = require("@codemirror/state");
 
 const VIEW_TYPE = "outlook-calendar-panel";
 const DRAG_TYPE = "application/x-outlook-calendar-event";
@@ -95,14 +102,22 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
     this.settingTab = new CalendarSettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
 
-    // Follow the daily note being worked on. Opening a note fires several
-    // events at once; they share one short timer. With no panel open the
-    // handler returns at once.
+    // Follow the daily note being worked on, and mark the events the active
+    // note holds. Opening a note fires several events at once, and typing
+    // fires one per keystroke, so they share one short timer and the note is
+    // checked once per burst. With no panel on screen the handlers return at
+    // once.
     const follow = () => {
       if (this.panels().length) this.scheduleFollow();
     };
     this.registerEvent(this.app.workspace.on("file-open", follow));
     this.registerEvent(this.app.workspace.on("active-leaf-change", follow));
+    this.registerEvent(this.app.workspace.on("editor-change", () => this.scheduleNoteCheck(300)));
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        if (file === this.app.workspace.getActiveFile()) this.scheduleNoteCheck(300);
+      })
+    );
 
     // An event dropped into a note lands on a line of its own.
     this.registerEvent(
@@ -114,11 +129,22 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
       })
     );
 
+    // A link beside each note line that holds a panel event, which shows the
+    // event in the panel. A visual layer only: the note's text is untouched.
+    this.eventIndex = null;
+    this.eventIndexDirty = true;
+    this.eventShape = this.eventLineShape();
+    this.eventLinkViews = new Set();
+    this.registerEditorExtension(eventLinkExtension(this));
+
     this.registerInterval(window.setInterval(() => this.tick(), TICK_MS));
   }
 
   onunload() {
     window.clearTimeout(this.followTimer);
+    window.clearTimeout(this.noteCheckTimer);
+    window.clearTimeout(this.eventLinkTimer);
+    this.eventLinkViews.clear();
     if (this.signInModal) this.signInModal.close();
   }
 
@@ -137,7 +163,24 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
     this.followTimer = window.setTimeout(() => {
       const date = this.dailyNoteDate(this.app.workspace.getActiveFile());
       this.panels().forEach((view) => view.followNote(date));
+      this.panels().forEach((view) => view.updateNoteMatches());
     }, 50);
+  }
+
+  // Typing and saving: the active note is checked once the burst is over,
+  // and only by a panel on screen.
+  scheduleNoteCheck(delay) {
+    if (!this.panels().some((view) => view.isVisible())) return;
+    window.clearTimeout(this.noteCheckTimer);
+    this.noteCheckTimer = window.setTimeout(() => {
+      this.panels().forEach((view) => view.updateNoteMatches());
+    }, delay);
+  }
+
+  // The active note's text, or null.
+  activeNote() {
+    const view = this.noteView();
+    return view && view.file ? { file: view.file, text: view.getViewData() } : null;
   }
 
   panels() {
@@ -147,18 +190,83 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
       .filter((view) => view instanceof CalendarPanelView);
   }
 
+  // Opens the panel, or shows it, and returns it (null if it cannot be).
   async openPanel() {
     let leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
     if (!leaf) {
       leaf = this.app.workspace.getRightLeaf(false);
-      if (!leaf) return;
+      if (!leaf) return null;
       await leaf.setViewState({ type: VIEW_TYPE, active: true });
     }
     await this.app.workspace.revealLeaf(leaf);
+    // A panel restored in a background tab loads only when first shown.
+    if (typeof leaf.loadIfDeferred === "function") await leaf.loadIfDeferred();
+    return leaf.view instanceof CalendarPanelView ? leaf.view : null;
   }
 
   async saveSettings() {
+    const shape = this.eventLineShape();
+    if (shape !== this.eventShape) this.eventsChanged();
+    this.eventShape = shape;
     await this.saveData(this.settings);
+  }
+
+  // The settings that decide what an event line looks like, and which
+  // events are shown.
+  eventLineShape() {
+    const s = this.settings;
+    return `${s.template}\u0000${s.timeFormat}\u0000${s.showDeclined}`;
+  }
+
+  // ── links from note lines to the panel ──
+
+  // The fetched events changed: the links in open notes are redrawn, once,
+  // after whatever changed them has finished.
+  eventsChanged() {
+    this.eventIndexDirty = true;
+    window.clearTimeout(this.eventLinkTimer);
+    this.eventLinkTimer = window.setTimeout(() => {
+      for (const links of this.eventLinkViews) links.redraw();
+    }, 0);
+  }
+
+  // What note lines are matched against, built on first use after a change:
+  // the events of every day fetched or read from the cache this session, as
+  // the panel shows them. Null when there are none. It never reads the
+  // sign-in or the cache itself: until a panel has done so, there are no
+  // links, so an editor opened at startup costs nothing.
+  eventIndexNow() {
+    if (this.eventIndexDirty) {
+      this.eventIndexDirty = false;
+      this.eventIndex = this.days instanceof Map ? buildEventIndex(this.days, this) : null;
+    }
+    return this.eventIndex;
+  }
+
+  // The keys an event's line can be found by, on a given day (see eventKeys).
+  eventKeys(event, day) {
+    return eventKeys(this.renderEvent(event, day), event.title, this.timeLabel(event, day), event.allDay ? "" : this.formatTime(event.start));
+  }
+
+  // Clicking a link in a note: shows that event in the panel. When the line
+  // matches several events (a recurring one, on each cached day), the one on
+  // the note's own day wins, then the panel's day, then the nearest to today.
+  async revealEvent(key, noteDay) {
+    const index = this.eventIndexNow();
+    const candidates = (index && index.get(key)) || [];
+    if (!candidates.length) {
+      new Notice("That event is no longer in the panel's calendar.");
+      return;
+    }
+    const shown = this.panels()[0];
+    const today = localToday();
+    const distance = (day) => Math.abs(parseDay(day) - parseDay(today));
+    const pick =
+      candidates.find((c) => c.day === noteDay) ||
+      candidates.find((c) => shown && c.day === shown.day) ||
+      candidates.slice().sort((a, b) => distance(a.day) - distance(b.day) || (a.day < b.day ? 1 : -1))[0];
+    const view = await this.openPanel();
+    if (view) view.reveal(pick.id, pick.day);
   }
 
   signIn() {
@@ -170,7 +278,7 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
   signOut() {
     this.auth.signOut();
     this.calendarList = null;
-    this.days = new Map();
+    this.resetDays();
     this.saveDayCache();
     this.panels().forEach((view) => view.clear());
     this.refreshSettingTab();
@@ -180,7 +288,7 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
   // The sign-in expired: forget its events, as signing out does.
   sessionEnded() {
     this.calendarList = null;
-    this.days = new Map();
+    this.resetDays();
     this.saveDayCache();
     this.refreshSettingTab();
   }
@@ -189,7 +297,7 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
     const who = this.auth.account ? ` as ${this.auth.account}` : "";
     new Notice(`Signed in to Microsoft${who}.`);
     this.calendarList = null;
-    this.days = new Map();
+    this.resetDays();
     this.panels().forEach((view) => view.refresh(true));
     this.refreshSettingTab();
   }
@@ -204,8 +312,17 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
   // from local storage the first time a panel needs it.
 
   dayCache() {
-    if (!this.days) this.days = this.loadDayCache();
+    if (!this.days) {
+      this.days = this.loadDayCache();
+      this.eventsChanged();
+    }
     return this.days;
+  }
+
+  // Forgets every fetched day: a new sign-in or choice of calendars.
+  resetDays() {
+    this.days = new Map();
+    this.eventsChanged();
   }
 
   loadDayCache() {
@@ -250,7 +367,7 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
     this.settings.calendars = calendars;
     this.settings.calendarsAccount = this.auth.account;
     await this.saveSettings();
-    this.days = new Map();
+    this.resetDays();
     this.saveDayCache();
     this.panels().forEach((view) => view.refresh(true));
   }
@@ -278,6 +395,7 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
     // Other calendars were chosen meanwhile; these are for the old choice.
     if (key !== this.calendarKey()) return events;
     this.dayCache().set(day, { events, failures, fetchedAt: Date.now() });
+    this.eventsChanged();
     this.saveDayCache();
     return events;
   }
@@ -410,6 +528,12 @@ class CalendarPanelView extends ItemView {
     this.ready = false;
     this.openDetails = new Set();
     this.lastToday = localToday();
+    // The event shown from a note, until the panel has settled on its day
+    // (see applyReveal), and the keys of the active note's lines.
+    this.pendingReveal = null;
+    this.noteKeys = null;
+    this.checkedNote = null;
+    this.rowsById = new Map();
   }
 
   getViewType() {
@@ -464,8 +588,12 @@ class CalendarPanelView extends ItemView {
         this.ready = true;
         // The active note may not have been known yet while restoring.
         if (this.plugin.settings.followDailyNote) this.followNote(this.plugin.dailyNoteDate(this.app.workspace.getActiveFile()));
-        this.render();
+        // A stale day starts loading before the first render, so an event
+        // shown from a note stays pending until the fetched rows are drawn.
         if (this.isVisible()) this.refresh(false);
+        this.render();
+        if (this.settled()) this.settleReveal();
+        this.updateNoteMatches();
       };
       if (window.requestIdleCallback) window.requestIdleCallback(start, { timeout: 3000 });
       else window.setTimeout(start, 500);
@@ -494,6 +622,7 @@ class CalendarPanelView extends ItemView {
 
   // Once a minute while on screen, and when the panel comes into view.
   tick() {
+    this.updateNoteMatches();
     const today = localToday();
     if (this.lastToday !== today) {
       const yesterday = this.lastToday;
@@ -572,6 +701,10 @@ class CalendarPanelView extends ItemView {
     } finally {
       this.loading = false;
       this.render();
+      // The fetched rows are drawn: an event shown from a note has had its
+      // flash, or is gone. One that failed to fetch is not retried each
+      // minute either.
+      if (this.day === day || this.settled()) this.settleReveal();
     }
     // Asked again while loading, or the day changed meanwhile.
     if (this.queued || this.day !== day) {
@@ -619,6 +752,7 @@ class CalendarPanelView extends ItemView {
     this.renderStatus();
     if (!this.listEl) return;
     this.listEl.empty();
+    this.rowsById = new Map();
     if (!this.plugin.auth.signedIn) return;
     const entry = this.plugin.dayCache().get(this.day);
     this.nowKey = this.timeStates();
@@ -630,6 +764,76 @@ class CalendarPanelView extends ItemView {
     }
     const now = Date.now();
     for (const event of events) this.renderRow(event, now);
+    if (this.pendingReveal) this.applyReveal();
+  }
+
+  // Shows one event from a note: moves to its day, scrolls to it and flashes
+  // it. A panel that is just opening, or a day that is still being fetched,
+  // rebuilds its rows once more; the event stays pending and is shown again
+  // after that, so the flash is not cut short.
+  reveal(id, day) {
+    this.pendingReveal = { id, day };
+    // The open daily note's day, or today, still counts as followed.
+    if (this.day !== day) this.setDay(day, day === this.noteDate || (!this.noteDate && day === localToday()));
+    else this.render();
+    if (this.settled()) this.settleReveal();
+  }
+
+  // Whether the rows drawn are the ones the panel will keep: it has started
+  // and is not fetching, nor about to fetch, the day shown.
+  settled() {
+    return this.ready && !this.loading && !(this.plugin.auth.signedIn && this.isVisible() && this.isStale());
+  }
+
+  applyReveal() {
+    const row = this.rowsById.get(this.pendingReveal.id);
+    if (!row) return false;
+    row.scrollIntoView({ block: "center" });
+    row.removeClass("is-revealed");
+    // Restarts the flash when the same event is shown twice in a row.
+    void row.offsetWidth;
+    row.addClass("is-revealed");
+    return true;
+  }
+
+  // Ends a pending reveal once the panel has settled, with a notice when the
+  // event is not there any more.
+  settleReveal() {
+    const pending = this.pendingReveal;
+    if (!pending) return;
+    this.pendingReveal = null;
+    // Another day was picked meanwhile, or the fetch failed and says so.
+    if (pending.day !== this.day || this.error) return;
+    if (!this.rowsById.has(pending.id)) new Notice("That event is no longer in your calendar.");
+  }
+
+  // Re-reads the active note and marks the events it already holds, without
+  // rebuilding the panel. Typing, saving and switching tabs fire often, so
+  // the work is skipped when the note and the settings that shape matching
+  // are what they were, and while the panel is not on screen.
+  updateNoteMatches() {
+    if (!this.ready || !this.isVisible()) return;
+    const note = this.plugin.activeNote();
+    const checked = { path: note && note.file.path, text: note && note.text, shape: this.plugin.eventShape };
+    const last = this.checkedNote;
+    if (last && last.path === checked.path && last.text === checked.text && last.shape === checked.shape) return;
+    this.checkedNote = checked;
+    this.noteKeys = note ? noteLineKeys(note.text) : null;
+    // A daily note holds the events of its own day only: last Monday's
+    // "- 09:00 Standup" is not today's.
+    this.noteKeysDay = note ? this.plugin.dailyNoteDate(note.file) : null;
+    for (const row of this.rowsById.values()) this.markNoteMatch(row);
+  }
+
+  // Whether the active note holds this event on the day shown: the same
+  // matching as the links beside note lines (see lineKeys and eventKeys).
+  inNote(event) {
+    if (!this.noteKeys || (this.noteKeysDay && this.noteKeysDay !== this.day)) return false;
+    return this.plugin.eventKeys(event, this.day).some((key) => this.noteKeys.has(key));
+  }
+
+  markNoteMatch(row) {
+    if (row.ocEvent) row.toggleClass("is-in-note", this.inNote(row.ocEvent));
   }
 
   renderRow(event, now) {
@@ -641,6 +845,9 @@ class CalendarPanelView extends ItemView {
     if (event.showAs) row.addClass(`is-${event.showAs}`);
     if (event.color) setCssProps(row, { "--oc-calendar-color": event.color });
     if (event.response === "declined") row.addClass("is-declined");
+    row.ocEvent = event;
+    this.rowsById.set(event.id, row);
+    this.markNoteMatch(row);
 
     row.createDiv({ cls: "oc-time", text: this.plugin.timeLabel(event, day) });
     const body = row.createDiv({ cls: "oc-body" });
@@ -1127,6 +1334,212 @@ function placeOnOwnLine(editor, text) {
     ],
   });
   editor.setSelection({ line: target, ch: indent.length }, { line: target, ch: indent.length + text.length });
+}
+
+// ── matching note lines to events ────────────────────────────────────────────
+//
+// One rule, shared by the links beside note lines and the panel's "in the
+// note" marks, so the two always agree. A line holds an event when, trimmed,
+// it is exactly what adding the event would insert; or when it is a list item
+// whose text, normalized (see normalizeText), is the event's time and title,
+// as "09:00–10:00 Standup" or "09:00 Standup". A title alone is not enough:
+// "- Lunch" is too common to be taken for an event.
+
+// A list item, with its checkbox mark (if any) and its text.
+const LIST_ITEM = /^(?:[-*+]|\d+[.)])\s+(?:\[(.)\]\s+)?(.*)$/;
+
+// What makes two event texts "the same": case, runs of whitespace and the
+// kind of dash do not count, and neither does a tail of emojis, dates, tags
+// and links, such as "📅 2026-11-20", "#meeting", "[Join](https://…)" or a
+// bare https:// link.
+const TRAILING_NOISE = new RegExp(
+  "(?:\\s*(?:" +
+    // Each token ends where its kind of text ends, so a run such as
+    // "12.12.1212.12.12" splits one way only; with overlapping splits, a
+    // line of a few hundred digits would backtrack for minutes.
+    "\\[[^\\]]*\\]\\([^)]*\\)" + // Markdown link
+    "|https?:\\/\\/\\S+(?!\\S)" + // bare link
+    "|#[\\p{L}\\p{N}_/-]+(?![\\p{L}\\p{N}_/-])" + // tag
+    "|\\d{4}-\\d{2}-\\d{2}(?:[ T]\\d{1,2}:\\d{2})?(?!\\d)" + // 2026-11-20, optional time
+    "|\\d{1,2}[./-]\\d{1,2}[./-]\\d{2,4}(?!\\d)" + // 20/11/2026, 20.11.26
+    // One symbol per repetition: a "+" here as well would nest two
+    // quantifiers and make long emoji runs backtrack for seconds.
+    "|[\\p{Extended_Pictographic}\\u2190-\\u21FF\\u2B00-\\u2BFF\\uFE0F\\u200D]" + // emojis and arrows
+    "))+\\s*$",
+  "u"
+);
+
+function normalizeText(text) {
+  return (text || "")
+    .replace(TRAILING_NOISE, "")
+    .replace(/[‒-―−]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+// Longer lines are never event lines, and are not worth normalizing.
+const MAX_EVENT_LINE = 1000;
+
+// The keys a note line can match an event by: "=" and the trimmed line, and
+// for a list item "~" and its normalized text. Empty for blank or long lines.
+function lineKeys(text) {
+  if (!text || text.length > MAX_EVENT_LINE) return [];
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  const keys = [`=${trimmed}`];
+  const item = trimmed.match(LIST_ITEM);
+  const normalized = item && normalizeText(item[2]);
+  if (normalized) keys.push(`~${normalized}`);
+  return keys;
+}
+
+// The keys an event can be found by: its line as inserted (the first line,
+// for a template of several), and its time and title, with the time as the
+// panel shows it or as the start alone.
+function eventKeys(rendered, title, time, start) {
+  const first = (rendered || "").split("\n").map((l) => l.trim()).find(Boolean);
+  const keys = first ? [`=${first}`] : [];
+  for (const prefix of [time, start]) {
+    const normalized = prefix && normalizeText(`${prefix} ${title}`);
+    if (normalized && !keys.includes(`~${normalized}`)) keys.push(`~${normalized}`);
+  }
+  return keys;
+}
+
+// Every key of every line of a note, for the panel's "in the note" marks.
+function noteLineKeys(text) {
+  const keys = new Set();
+  for (const line of (text || "").split("\n")) for (const key of lineKeys(line)) keys.add(key);
+  return keys;
+}
+
+// The fetched days' events keyed like note lines: each key maps to the
+// { id, day } of every shown event it stands for, in day order.
+function buildEventIndex(days, plugin) {
+  const index = new Map();
+  for (const day of [...days.keys()].sort()) {
+    for (const event of plugin.visibleEvents(dayEvents(days.get(day).events, day))) {
+      for (const key of plugin.eventKeys(event, day)) {
+        const list = index.get(key) || [];
+        if (!list.some((c) => c.id === event.id && c.day === day)) list.push({ id: event.id, day });
+        index.set(key, list);
+      }
+    }
+  }
+  return index.size ? index : null;
+}
+
+// The index key a note line matches, or null: its exact line first, then
+// its normalized text.
+function eventKeyForLine(index, text) {
+  for (const key of lineKeys(text)) if (index.has(key)) return key;
+  return null;
+}
+
+// The editor side of the links: a small button at the end of each line that
+// holds a panel event. Only the lines on screen are looked at, and only when
+// the text, the visible part or the events change; moving the cursor costs
+// nothing. Each distinct line text is looked up once, so scrolling back and
+// typing elsewhere reuse earlier answers.
+function eventLinkExtension(plugin) {
+  const redrawEffect = StateEffect.define();
+  const decorations = new Map(); // line text → decoration or null
+  let cachedIndex = null;
+
+  // Holds only the matched key: which event it shows is decided on click,
+  // against the events then, and the note's own day.
+  class EventLinkWidget extends WidgetType {
+    constructor(key) {
+      super();
+      this.key = key;
+    }
+    eq(other) {
+      return other.key === this.key;
+    }
+    toDOM(view) {
+      const el = document.createElement("span");
+      el.className = "oc-reveal";
+      el.setAttribute("role", "button");
+      el.setAttribute("aria-label", "Show in Outlook calendar panel");
+      // Keeps the cursor and focus where they are.
+      el.addEventListener("mousedown", (evt) => {
+        evt.preventDefault();
+        evt.stopPropagation();
+      });
+      el.addEventListener("click", (evt) => {
+        evt.preventDefault();
+        evt.stopPropagation();
+        const info = editorInfoField && view.state.field ? view.state.field(editorInfoField, false) : null;
+        const noteDay = plugin.dailyNoteDate(info && info.file);
+        plugin.revealEvent(this.key, noteDay).catch((e) => new Notice(`Could not show the event: ${e.message}`));
+      });
+      return el;
+    }
+    // The editor leaves clicks on the button alone.
+    ignoreEvent() {
+      return true;
+    }
+  }
+
+  const decorationFor = (index, text) => {
+    if (index !== cachedIndex || decorations.size > 2000) {
+      decorations.clear();
+      cachedIndex = index;
+    }
+    let deco = decorations.get(text);
+    if (deco === undefined) {
+      const key = eventKeyForLine(index, text);
+      deco = key ? Decoration.widget({ widget: new EventLinkWidget(key), side: 1 }) : null;
+      decorations.set(text, deco);
+    }
+    return deco;
+  };
+
+  return ViewPlugin.fromClass(
+    class {
+      constructor(view) {
+        this.view = view;
+        this.decorations = this.build();
+        plugin.eventLinkViews.add(this);
+      }
+      update(update) {
+        if (update.docChanged || update.viewportChanged || update.transactions.some((tr) => tr.effects.some((e) => e.is(redrawEffect)))) {
+          this.decorations = this.build();
+        }
+      }
+      redraw() {
+        this.view.dispatch({ effects: redrawEffect.of(null) });
+      }
+      destroy() {
+        plugin.eventLinkViews.delete(this);
+      }
+      build() {
+        const index = plugin.eventIndexNow();
+        if (!index) return Decoration.none;
+        const doc = this.view.state.doc;
+        const builder = new RangeSetBuilder();
+        let last = 0;
+        for (const { from, to } of this.view.visibleRanges) {
+          let line = doc.lineAt(from);
+          // Ranges can share a line; each line is decorated once, in order.
+          if (line.number <= last) {
+            if (last >= doc.lines) break;
+            line = doc.line(last + 1);
+          }
+          while (line.from <= to) {
+            const deco = decorationFor(index, line.text);
+            if (deco) builder.add(line.to, line.to, deco);
+            last = line.number;
+            if (line.number === doc.lines) break;
+            line = doc.line(line.number + 1);
+          }
+        }
+        return builder.finish();
+      }
+    },
+    { decorations: (links) => links.decorations }
+  );
 }
 
 // ── Microsoft sign-in ────────────────────────────────────────────────────────

@@ -15,6 +15,22 @@ event of the day at once.
 - **Join** opens an online meeting. Click an event to see its organiser, the
   start of its description and an **Open in Outlook** link.
 - Cancelled events are hidden, and so are declined ones unless you turn them on.
+- An event the active note already holds has no **+** button. A daily note
+  counts only for its own day.
+- In a note, a small calendar icon at the end of each line that holds an
+  event shows that event in the panel: the panel moves to its day, scrolls to
+  it and it flashes. The icon is drawn by the editor and never written into
+  the note; it appears in editing and live preview, not in reading view.
+
+A note line holds an event when, trimmed, it is exactly what adding the event
+would insert (its first line, for a template of several lines), or when it
+is a list item whose text is the event's time and title, such as
+`- 09:00–10:00 Standup` or `- [ ] 09:00 standup`. Case, extra spaces, the
+kind of dash and a tail of tags, dates, emojis and links do not count. A title alone, such as `- Standup`, does not match. The icons cover
+the days the panel has shown or read from its cache since Obsidian started.
+When a line matches an event on several days, as a recurring one does, the
+icon shows the one on the note's own day if it is a daily note, else the
+panel's day, else the one nearest to today.
 
 The plugin only reads your calendar. It never creates, changes or answers
 anything in Outlook.
@@ -33,8 +49,17 @@ The plugin is built not to slow Obsidian down:
   fetches. Nothing waits for Microsoft.
 - A panel that is not on screen (a collapsed sidebar or a background tab)
   does nothing. It catches up when you show it.
-- There are no listeners on typing or saving. The plugin reacts only to
-  opening a note, to read its file name.
+- Opening a note reads its file name. While the panel is on screen, typing
+  and saving in the active note restart one shared 300 ms timer; when it
+  fires, the panel reads the note's text once and compares it with the last
+  check, and only a changed note is matched against the shown events. With
+  the panel closed or hidden, these handlers return at once.
+- The icons beside event lines only look at the lines on screen, only when
+  the text, the visible part or the fetched events change, and each distinct
+  line text is matched once, so moving the cursor costs nothing and typing
+  costs one lookup for the line being typed. Until the panel has read its
+  cache, there are no icons, so an editor opened at startup reads neither
+  the sign-in nor the cache.
 - One timer a minute moves the "now" highlight and refreshes a day older than
   **Refresh after** (15 minutes by default), and only while the panel is on
   screen.
@@ -173,7 +198,8 @@ The tests load `src/plugin.js` against a small stand-in for the Obsidian API.
 They cover startup cost (no request and no secret read on load, no fetch
 before the layout is ready or while the panel is hidden), sign-in, token
 refresh, day windows across summer time changes, all-day and multi-day
-events, the cache, following the daily note and inserting events.
+events, the cache, following the daily note, inserting events, matching note
+lines to events, the editor icons and showing an event from a note.
 
 To release, bump `version` in `manifest.json` and `package.json`, add it to
 `versions.json` and commit. Push the tag first and the branch once the release
