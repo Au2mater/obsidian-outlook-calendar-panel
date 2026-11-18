@@ -5,7 +5,7 @@
     "build": "node scripts/build.js",
     "test": "node test/run.js"
   },
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Obsidian plugin: a day of your Outlook calendar in a sidebar, with events you can drag into notes.",
   "license": "MIT"
 }
