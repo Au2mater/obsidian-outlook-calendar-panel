@@ -5,13 +5,15 @@
 // below the cursor.
 //
 // Startup cost is kept near zero on purpose: onload only registers things and
-// reads neither secret storage nor the network. A panel restored with the
-// workspace shows its cached events, and fetches only once the layout is
-// ready, the app is idle and the panel is on screen. The only work while
-// typing is one shared timer that, once typing pauses for 300 ms and only
-// while a panel is on screen, checks which events the active note holds; and
-// the editor's icons beside event lines, which look only at the lines on
-// screen.
+// reads neither secret storage nor the network. When a note shows a line that
+// may be an event, the sign-in and the cached events are read once (no
+// network) for the editor's links, after the layout is ready and the app is
+// idle. A panel restored with the workspace shows
+// its cached events, and fetches only once the layout is ready, the app is
+// idle and the panel is on screen. The only work while typing is one shared
+// timer that, once typing pauses for 300 ms and only while a panel is on
+// screen, checks which events the active note holds; and the editor's icons
+// beside event lines, which look only at the lines on screen.
 //
 // Plain JavaScript with no dependencies: `npm run build` checks this file and
 // writes it unchanged to main.js, the file Obsidian loads (see README.md).
@@ -60,6 +62,8 @@ const DEFAULT_SETTINGS = {
   dailyNoteFormat: "YYYY-MM-DD",
   followDailyNote: true,
   showDeclined: false,
+  // The date picker's first day of the week: "locale", "monday" or "sunday".
+  weekStart: "locale",
   // The calendars to show, as { id, name, color }; empty shows the default
   // calendar only.
   calendars: [],
@@ -141,6 +145,8 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
   }
 
   onunload() {
+    this.unloaded = true;
+    if (this.cancelCacheLoad) this.cancelCacheLoad();
     window.clearTimeout(this.followTimer);
     window.clearTimeout(this.noteCheckTimer);
     window.clearTimeout(this.eventLinkTimer);
@@ -233,14 +239,32 @@ module.exports = class OutlookCalendarPlugin extends Plugin {
   // What note lines are matched against, built on first use after a change:
   // the events of every day fetched or read from the cache this session, as
   // the panel shows them. Null when there are none. It never reads the
-  // sign-in or the cache itself: until a panel has done so, there are no
-  // links, so an editor opened at startup costs nothing.
+  // sign-in or the cache itself: until a panel or the idle load asked for
+  // by wantDayCache has done so, there are no links, so an editor opened at
+  // startup costs nothing.
   eventIndexNow() {
     if (this.eventIndexDirty) {
       this.eventIndexDirty = false;
       this.eventIndex = this.days instanceof Map ? buildEventIndex(this.days, this) : null;
     }
     return this.eventIndex;
+  }
+
+  // An editor shows a line that may be an event, and no panel has read the
+  // cached events yet: a panel in a background tab is never opened, and a
+  // hidden one waits to be shown. So the sign-in and the cache are read once
+  // (no network) when the layout is ready and the app is idle, which redraws
+  // the links.
+  wantDayCache() {
+    if (this.days || this.cacheLoadAsked) return;
+    this.cacheLoadAsked = true;
+    this.app.workspace.onLayoutReady(() => {
+      if (this.unloaded) return;
+      this.cancelCacheLoad = whenIdle(() => {
+        this.cancelCacheLoad = null;
+        if (!this.unloaded) this.dayCache();
+      }, 5000);
+    });
   }
 
   // The keys an event's line can be found by, on a given day (see eventKeys).
@@ -534,6 +558,8 @@ class CalendarPanelView extends ItemView {
     this.noteKeys = null;
     this.checkedNote = null;
     this.rowsById = new Map();
+    // The month the date picker shows while it is open ("YYYY-MM-01").
+    this.pickerMonth = null;
   }
 
   getViewType() {
@@ -557,7 +583,16 @@ class CalendarPanelView extends ItemView {
     const prev = nav.createEl("button", { attr: { "aria-label": "Previous day" } });
     setIcon(prev, "chevron-left");
     prev.addEventListener("click", () => this.setDay(addDays(this.day, -1), false));
-    this.titleEl = nav.createDiv({ cls: "oc-title" });
+    // Clicking the date opens a month to pick a day from. Nothing of it is
+    // built until then.
+    this.titleEl = nav.createDiv({ cls: "oc-title", attr: { role: "button", tabindex: "0", "aria-haspopup": "dialog" } });
+    this.titleEl.addEventListener("click", () => this.togglePicker());
+    this.titleEl.addEventListener("keydown", (evt) => {
+      if (evt.key === "Escape") return this.escapePicker(evt);
+      if (evt.key !== "Enter" && evt.key !== " ") return;
+      evt.preventDefault();
+      this.togglePicker();
+    });
     const next = nav.createEl("button", { attr: { "aria-label": "Next day" } });
     setIcon(next, "chevron-right");
     next.addEventListener("click", () => this.setDay(addDays(this.day, 1), false));
@@ -566,6 +601,12 @@ class CalendarPanelView extends ItemView {
     const refresh = nav.createEl("button", { attr: { "aria-label": "Refresh" } });
     setIcon(refresh, "refresh-cw");
     refresh.addEventListener("click", () => this.refresh(true));
+
+    this.pickerEl = root.createDiv({ cls: "oc-picker is-hidden" });
+    // Escape closes the picker, with focus on the date or inside the picker.
+    this.pickerEl.addEventListener("keydown", (evt) => {
+      if (evt.key === "Escape") this.escapePicker(evt);
+    });
 
     this.statusEl = root.createDiv({ cls: "oc-status" });
     this.listEl = root.createDiv({ cls: "oc-events" });
@@ -595,8 +636,10 @@ class CalendarPanelView extends ItemView {
         if (this.settled()) this.settleReveal();
         this.updateNoteMatches();
       };
-      if (window.requestIdleCallback) window.requestIdleCallback(start, { timeout: 3000 });
-      else window.setTimeout(start, 500);
+      this.cancelStart = whenIdle(() => {
+        this.cancelStart = null;
+        start();
+      }, 3000);
     });
 
     // A panel in a collapsed sidebar or a background tab does no work; when
@@ -610,6 +653,8 @@ class CalendarPanelView extends ItemView {
   }
 
   async onClose() {
+    if (this.cancelStart) this.cancelStart();
+    this.closePicker();
     if (this.observer) this.observer.disconnect();
   }
 
@@ -633,7 +678,9 @@ class CalendarPanelView extends ItemView {
         this.setDay(today, true);
         return;
       }
-      this.render(); // the "Today" title and button
+      // The "Today" title and button, and the picker's today.
+      if (this.pickerMonth) this.showPickerMonth(this.pickerMonth);
+      this.render();
     }
     // Signed out, the sign-in box stays as it is (and keeps its focus).
     if (!this.plugin.auth.signedIn) return;
@@ -671,6 +718,8 @@ class CalendarPanelView extends ItemView {
     this.day = day;
     this.following = following;
     this.error = null;
+    // An open date picker moves to the new day's month.
+    if (this.pickerMonth) this.showPickerMonth(day);
     this.render();
     // A panel that is not on screen fetches when it is shown.
     if (this.ready && this.isVisible() && this.isStale()) this.refresh(false);
@@ -745,7 +794,9 @@ class CalendarPanelView extends ItemView {
   render() {
     if (this.titleEl) {
       const today = localToday();
-      this.titleEl.setText(this.day === today ? `Today · ${longDate(this.day)}` : longDate(this.day));
+      const title = this.day === today ? `Today · ${longDate(this.day)}` : longDate(this.day);
+      this.titleEl.setText(title);
+      this.titleEl.setAttr("aria-label", `${title}. Pick a date`);
       this.todayEl.toggleClass("is-hidden", this.day === today);
     }
     if (!this.ready) return;
@@ -767,6 +818,89 @@ class CalendarPanelView extends ItemView {
     if (this.pendingReveal) this.applyReveal();
   }
 
+  // Whether showing this day still counts as following: it is the open daily
+  // note's day, or today when no daily note is open.
+  followsDay(day) {
+    return day === this.noteDate || (!this.noteDate && day === localToday());
+  }
+
+  togglePicker() {
+    if (this.pickerMonth) this.closePicker();
+    else this.openPicker();
+  }
+
+  // Builds the picker's head once per opening, so the month buttons keep
+  // their focus while stepping through months.
+  openPicker() {
+    const box = this.pickerEl;
+    if (!box) return;
+    box.empty();
+    box.removeClass("is-hidden");
+    const head = box.createDiv({ cls: "oc-picker-head" });
+    const month = head.createDiv({ cls: "oc-picker-month" });
+    this.pickerMonthNameEl = month.createSpan({ cls: "oc-picker-month-name" });
+    this.pickerYearEl = month.createSpan({ cls: "oc-picker-year" });
+    const prev = head.createEl("button", { cls: "clickable-icon", attr: { "aria-label": "Previous month" } });
+    setIcon(prev, "chevron-left");
+    prev.addEventListener("click", () => this.showPickerMonth(addMonths(this.pickerMonth, -1)));
+    const next = head.createEl("button", { cls: "clickable-icon", attr: { "aria-label": "Next month" } });
+    setIcon(next, "chevron-right");
+    next.addEventListener("click", () => this.showPickerMonth(addMonths(this.pickerMonth, 1)));
+    this.pickerGridEl = box.createDiv({ cls: "oc-picker-grid" });
+    this.showPickerMonth(this.day);
+  }
+
+  closePicker() {
+    this.pickerMonth = null;
+    if (!this.pickerEl) return;
+    this.pickerEl.empty();
+    this.pickerEl.addClass("is-hidden");
+    this.pickerGridEl = null;
+  }
+
+  // The picked day's button is gone with the picker, so focus goes back to
+  // the date.
+  pickDay(day) {
+    this.closePicker();
+    if (this.titleEl) this.titleEl.focus();
+    if (day !== this.day) this.setDay(day, this.followsDay(day));
+  }
+
+  escapePicker(evt) {
+    if (!this.pickerMonth) return;
+    evt.stopPropagation();
+    this.closePicker();
+    this.titleEl.focus();
+  }
+
+  // The date picker, in the spirit of the Calendar plugin: the month with
+  // ‹ › to step through months, the weekdays, and the days, with today and
+  // the day shown marked.
+  showPickerMonth(day) {
+    if (!this.pickerGridEl) return;
+    this.pickerMonth = `${day.slice(0, 7)}-01`;
+    const first = parseDay(this.pickerMonth);
+    this.pickerMonthNameEl.setText(first.toLocaleDateString([], { month: "long" }));
+    this.pickerYearEl.setText(` ${first.getFullYear()}`);
+    const grid = this.pickerGridEl;
+    grid.empty();
+    const chosen = this.plugin.settings.weekStart;
+    const weekStart = chosen === "monday" ? 1 : chosen === "sunday" ? 0 : firstDayOfWeek();
+    for (let i = 0; i < 7; i++) {
+      // 4 January 2026 was a Sunday.
+      const name = new Date(2026, 0, 4 + ((weekStart + i) % 7)).toLocaleDateString([], { weekday: "short" });
+      grid.createDiv({ cls: "oc-picker-weekday", text: name });
+    }
+    const today = localToday();
+    for (const d of monthGrid(first.getFullYear(), first.getMonth(), weekStart)) {
+      const cell = grid.createEl("button", { cls: "oc-picker-day", text: String(Number(d.slice(8))), attr: { "aria-label": longDate(d) } });
+      if (d.slice(0, 7) !== this.pickerMonth.slice(0, 7)) cell.addClass("is-adjacent");
+      if (d === today) cell.addClass("is-today");
+      if (d === this.day) cell.addClass("is-active");
+      cell.addEventListener("click", () => this.pickDay(d));
+    }
+  }
+
   // Shows one event from a note: moves to its day, scrolls to it and flashes
   // it. A panel that is just opening, or a day that is still being fetched,
   // rebuilds its rows once more; the event stays pending and is shown again
@@ -774,7 +908,7 @@ class CalendarPanelView extends ItemView {
   reveal(id, day) {
     this.pendingReveal = { id, day };
     // The open daily note's day, or today, still counts as followed.
-    if (this.day !== day) this.setDay(day, day === this.noteDate || (!this.noteDate && day === localToday()));
+    if (this.day !== day) this.setDay(day, this.followsDay(day));
     else this.render();
     if (this.settled()) this.settleReveal();
   }
@@ -948,6 +1082,18 @@ class CalendarSettingTab extends PluginSettingTab {
         })
       );
     new Setting(advanced)
+      .setName("Start week on")
+      .setDesc("The first day of the week in the date picker.")
+      .addDropdown((d) =>
+        d
+          .addOptions({ locale: "Your language's", monday: "Monday", sunday: "Sunday" })
+          .setValue(s.weekStart)
+          .onChange(async (v) => {
+            s.weekStart = v;
+            await this.plugin.saveSettings();
+          })
+      );
+    new Setting(advanced)
       .setName("Show declined events")
       .addToggle((t) =>
         t.setValue(s.showDeclined).onChange(async (v) => {
@@ -1085,6 +1231,57 @@ function addDays(day, n) {
   const date = parseDay(day);
   date.setDate(date.getDate() + n);
   return isoDay(date);
+}
+
+function addMonths(day, n) {
+  const date = parseDay(day);
+  return isoDay(new Date(date.getFullYear(), date.getMonth() + n, 1));
+}
+
+// The days a month view shows: whole weeks from the one holding the 1st to
+// the one holding the last day, as YYYY-MM-DD. `weekStart` is 0 for Sunday.
+function monthGrid(year, month, weekStart) {
+  const first = new Date(year, month, 1);
+  const lead = (first.getDay() - weekStart + 7) % 7;
+  const length = new Date(year, month + 1, 0).getDate();
+  const date = new Date(year, month, 1 - lead);
+  const days = [];
+  for (let i = 0; i < Math.ceil((lead + length) / 7) * 7; i++) {
+    days.push(isoDay(date));
+    date.setDate(date.getDate() + 1);
+  }
+  return days;
+}
+
+// The first day of the week (0 is Sunday) in the language dates are written
+// in (the one toLocaleDateString uses, as for the day and month names), else
+// in Obsidian's language, else Monday.
+function firstDayOfWeek() {
+  try {
+    const locale = new Intl.Locale(new Intl.DateTimeFormat().resolvedOptions().locale);
+    const info = typeof locale.getWeekInfo === "function" ? locale.getWeekInfo() : locale.weekInfo;
+    if (info && Number.isInteger(info.firstDay)) return info.firstDay % 7;
+  } catch (_) {
+    // Fall through.
+  }
+  try {
+    const day = moment.localeData().firstDayOfWeek();
+    if (Number.isInteger(day) && day >= 0 && day < 7) return day;
+  } catch (_) {
+    // Fall through.
+  }
+  return 1;
+}
+
+// Runs fn once the app is idle (or after `timeout` ms at most); returns a
+// function that cancels it.
+function whenIdle(fn, timeout) {
+  if (window.requestIdleCallback) {
+    const id = window.requestIdleCallback(fn, { timeout });
+    return () => window.cancelIdleCallback && window.cancelIdleCallback(id);
+  }
+  const id = window.setTimeout(fn, Math.min(timeout, 1000));
+  return () => window.clearTimeout(id);
 }
 
 // A local day as [start, end) in milliseconds. Built from calendar dates, not
@@ -1514,9 +1711,24 @@ function eventLinkExtension(plugin) {
       destroy() {
         plugin.eventLinkViews.delete(this);
       }
+      // Whether a line on screen could be an event line: a list item, or a
+      // line with a time in it.
+      showsEventLike() {
+        const doc = this.view.state.doc;
+        for (const { from, to } of this.view.visibleRanges) {
+          for (let line = doc.lineAt(from); ; line = doc.line(line.number + 1)) {
+            if (line.text.length <= MAX_EVENT_LINE && (LIST_ITEM.test(line.text.trim()) || /\d[:.]\d\d/.test(line.text))) return true;
+            if (line.to >= to || line.number === doc.lines) break;
+          }
+        }
+        return false;
+      }
       build() {
         const index = plugin.eventIndexNow();
-        if (!index) return Decoration.none;
+        if (!index) {
+          if (!plugin.days && this.showsEventLike()) plugin.wantDayCache();
+          return Decoration.none;
+        }
         const doc = this.view.state.doc;
         const builder = new RangeSetBuilder();
         let last = 0;

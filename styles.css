@@ -20,10 +20,90 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  cursor: pointer;
+  border-radius: var(--radius-s);
+  padding: var(--size-2-1) var(--size-4-1);
+}
+
+.oc-title:hover {
+  background: var(--background-modifier-hover);
 }
 
 .oc-today.is-hidden {
   display: none;
+}
+
+/* The date picker under the date: a month like the Calendar plugin's. */
+.oc-picker {
+  padding: var(--size-4-1) 0 var(--size-4-2);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.oc-picker.is-hidden {
+  display: none;
+}
+
+.oc-picker-head {
+  display: flex;
+  align-items: center;
+  gap: var(--size-2-1);
+  padding: 0 var(--size-4-1) var(--size-4-2);
+}
+
+.oc-picker-month {
+  flex: 1;
+  font-size: var(--font-ui-large);
+  font-weight: var(--font-bold);
+}
+
+.oc-picker-year {
+  color: var(--interactive-accent);
+}
+
+.oc-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  row-gap: 2px;
+  text-align: center;
+}
+
+.oc-picker-weekday {
+  padding: var(--size-2-2) 0;
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* Plain text, not a button box, until hovered. */
+.oc-picker-grid button.oc-picker-day {
+  height: auto;
+  padding: var(--size-4-1) 0;
+  background: none;
+  box-shadow: none;
+  border: none;
+  border-radius: var(--radius-s);
+  font-size: var(--font-ui-small);
+  color: var(--text-normal);
+  cursor: pointer;
+}
+
+.oc-picker-grid button.oc-picker-day:hover {
+  background: var(--background-modifier-hover);
+}
+
+.oc-picker-grid button.oc-picker-day.is-adjacent {
+  color: var(--text-faint);
+}
+
+.oc-picker-grid button.oc-picker-day.is-today {
+  color: var(--interactive-accent);
+  font-weight: var(--font-bold);
+}
+
+.oc-picker-grid button.oc-picker-day.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
 }
 
 .oc-status {

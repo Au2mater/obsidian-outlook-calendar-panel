@@ -18,7 +18,7 @@ Module._resolveFilename = function (request, ...rest) {
 const mainPath = path.join(__dirname, "..", "src", "plugin.js");
 const source =
   fs.readFileSync(mainPath, "utf8") +
-  "\nmodule.exports.__internals = { MicrosoftAuth, fetchDayEvents, eventView, dayEvents, dayBounds, addDays, placeOnOwnLine, insertOnOwnLine, describeAuthError, localToday, lineKeys, eventKeys, noteLineKeys, buildEventIndex, eventKeyForLine };\n";
+  "\nmodule.exports.__internals = { MicrosoftAuth, fetchDayEvents, eventView, dayEvents, dayBounds, addDays, placeOnOwnLine, insertOnOwnLine, describeAuthError, localToday, lineKeys, eventKeys, noteLineKeys, buildEventIndex, eventKeyForLine, monthGrid, addMonths };\n";
 const mod = new Module(mainPath, module);
 mod.filename = mainPath;
 mod.paths = Module._nodeModulePaths(path.dirname(mainPath));
@@ -39,6 +39,8 @@ const {
   noteLineKeys,
   buildEventIndex,
   eventKeyForLine,
+  monthGrid,
+  addMonths,
 } = CalendarPlugin.__internals;
 
 global.window = { setTimeout: (fn) => setImmediate(fn), clearTimeout: (id) => id && clearImmediate(id), setInterval, clearInterval };
@@ -90,6 +92,7 @@ function el(tag = "div", opts = {}) {
     toggleClass: (c, on) => (on ? node.cls.add(c) : node.cls.delete(c)),
     setAttr() {},
     setText: (t) => (node.text = t),
+    focus: () => (node.focused = true),
     addEventListener: (type, fn) => (node.listeners[type] = fn),
     createDiv: (o) => node.createEl("div", o),
     createSpan: (o) => node.createEl("span", o),
@@ -669,6 +672,52 @@ test("an editor opened at startup reads neither the sign-in nor the cache", asyn
   assert.strictEqual(global.__requests.length, 0);
 });
 
+test("with no panel open, the links appear once the app is idle after startup", async () => {
+  // A session and its cached events from an earlier run.
+  const first = await signedInPlugin();
+  global.__handler = () => ({ body: { value: [graphEvent("a", "Standup", "2026-11-17T08:00:00", "2026-11-17T08:15:00")] } });
+  await first.loadDay("2026-11-17");
+  const secrets = first.app.secrets;
+  const local = first.app.local;
+  first.onunload();
+
+  reset();
+  global.__data = { clientId: "client", tenant: "tenant" };
+  global.__handler = () => assert.fail("no request expected");
+  const plugin = new CalendarPlugin();
+  Object.assign(plugin.app.secrets, secrets);
+  Object.assign(plugin.app.local, local);
+  await plugin.onload();
+  const { cls } = global.__editorExtension;
+  const view = fakeEditorView(["- 09:00–09:15 Standup"], [[1, 1]]);
+  const links = new cls(view);
+  assert.deepStrictEqual(links.decorations, []);
+  assert.strictEqual(global.__secretReads, 0, "nothing read while starting");
+  global.__layoutReady();
+  await tick();
+  await tick();
+  assert.strictEqual(global.__leaves.length, 0, "no panel");
+  assert.strictEqual(view.dispatched.length, 1, "the open editor is told to redraw");
+  links.update({ docChanged: false, viewportChanged: false, transactions: [{ effects: [view.dispatched[0].effects] }] });
+  assert.deepStrictEqual(links.decorations.map((d) => d.from), [21]);
+  assert.strictEqual(global.__requests.length, 0, "read from the cache, not fetched");
+});
+
+test("a note with no line like an event never reads the sign-in or the cache", async () => {
+  reset();
+  global.__data = { clientId: "client", tenant: "tenant" };
+  global.__handler = () => assert.fail("no request expected");
+  const plugin = new CalendarPlugin();
+  await plugin.onload();
+  const { cls } = global.__editorExtension;
+  new cls(fakeEditorView(["# Notes", "Just some text."], [[1, 2]]));
+  global.__layoutReady && global.__layoutReady();
+  await tick();
+  await tick();
+  assert.strictEqual(global.__secretReads, 0);
+  assert.ok(!plugin.days);
+});
+
 test("the editor links cover visible event lines only, and redraw when events change", async () => {
   const plugin = await signedInPlugin();
   const { cls } = global.__editorExtension;
@@ -798,6 +847,123 @@ test("the + button hides for events the active note holds, checked only while on
   plugin.scheduleNoteCheck(300);
   await tick();
   assert.strictEqual(reads, 0);
+});
+
+// ── date picker ──
+
+test("the month grid covers whole weeks, across year ends and summer time", () => {
+  const nov = monthGrid(2026, 10, 1); // November 2026 starts on a Sunday
+  assert.strictEqual(nov[0], "2026-10-26");
+  assert.strictEqual(nov[6], "2026-11-01");
+  assert.strictEqual(nov[nov.length - 1], "2026-12-06");
+  assert.strictEqual(nov.length, 42);
+  const novSunday = monthGrid(2026, 10, 0);
+  assert.strictEqual(novSunday[0], "2026-11-01");
+  assert.strictEqual(novSunday.length, 35);
+  const jan = monthGrid(2027, 0, 1);
+  assert.strictEqual(jan[0], "2026-12-28");
+  assert.ok(jan.includes("2027-01-31"));
+  // March and October 2026 change to and from summer time in Copenhagen.
+  for (const [month, weekStart] of [[2, 1], [2, 0], [9, 1], [9, 0]]) {
+    const days = monthGrid(2026, month, weekStart);
+    assert.strictEqual(days.length % 7, 0);
+    assert.strictEqual(new Set(days).size, days.length, "no day twice");
+    for (let i = 1; i < days.length; i++) assert.strictEqual(addDays(days[i - 1], 1), days[i]);
+    assert.strictEqual(new Date(days[0] + "T12:00").getDay(), weekStart);
+  }
+  assert.strictEqual(addMonths("2026-12-01", 1), "2027-01-01");
+  assert.strictEqual(addMonths("2026-01-31", -1), "2025-12-01");
+});
+
+test("clicking the date opens a month to pick a day from", async () => {
+  const plugin = await signedInPlugin();
+  global.__handler = () => ({ body: { value: [] } });
+  const view = await openView(plugin);
+  const picker = view.contentEl.find("oc-picker")[0];
+  assert.ok(picker.cls.has("is-hidden"));
+  assert.strictEqual(picker.children.length, 0, "nothing is built until it is opened");
+  view.titleEl.listeners.click();
+  assert.ok(!picker.cls.has("is-hidden"));
+  const days = picker.find("oc-picker-day");
+  assert.ok(days.length >= 28);
+  const today = localToday();
+  assert.strictEqual(days.filter((d) => d.cls.has("is-today")).length, 1);
+  assert.strictEqual(days.filter((d) => d.cls.has("is-active")).length, 1);
+  // Next month, then pick its 15th. The month buttons stay, keeping focus.
+  const nextButton = picker.find("oc-picker-head")[0].children[2];
+  nextButton.listeners.click();
+  assert.strictEqual(picker.find("oc-picker-head")[0].children[2], nextButton);
+  const next = addMonths(`${today.slice(0, 7)}-01`, 1);
+  const fifteenth = `${next.slice(0, 7)}-15`;
+  const cell = picker.find("oc-picker-day").find((d) => d.text === "15" && !d.cls.has("is-adjacent"));
+  view.titleEl.focused = false;
+  cell.listeners.click();
+  assert.ok(view.titleEl.focused, "focus goes back to the date");
+  assert.strictEqual(view.day, fifteenth);
+  assert.strictEqual(view.following, false, "a picked day is the user's");
+  assert.ok(picker.cls.has("is-hidden"), "picking closes it");
+  // Picking today follows again, as the Today button does.
+  view.titleEl.listeners.click();
+  picker.find("oc-picker-head")[0].children[1].listeners.click();
+  picker.find("oc-picker-day").find((d) => d.cls.has("is-today")).listeners.click();
+  assert.strictEqual(view.day, today);
+  assert.strictEqual(view.following, true);
+  // Escape and a second click on the date close it too.
+  view.titleEl.listeners.click();
+  view.titleEl.listeners.keydown({ key: "Escape", stopPropagation() {} });
+  assert.ok(picker.cls.has("is-hidden"), "Escape on the date");
+  view.titleEl.focused = false;
+  view.titleEl.listeners.click();
+  picker.listeners.keydown({ key: "Escape", stopPropagation() {} });
+  assert.ok(picker.cls.has("is-hidden"), "Escape inside the picker");
+  assert.ok(view.titleEl.focused);
+  view.titleEl.listeners.click();
+  view.titleEl.listeners.click();
+  assert.ok(picker.cls.has("is-hidden"));
+  // An open picker follows the day the arrows move to.
+  view.titleEl.listeners.click();
+  view.setDay(fifteenth, false);
+  assert.strictEqual(picker.find("oc-picker-day").find((d) => d.cls.has("is-active")).text, "15");
+});
+
+test("the date picker starts the week where the language its names are in does", async () => {
+  const plugin = await signedInPlugin();
+  global.__handler = () => ({ body: { value: [] } });
+  const view = await openView(plugin);
+  view.setDay("2026-11-18", false);
+  view.titleEl.listeners.click();
+  const picker = view.contentEl.find("oc-picker")[0];
+  const locale = new Intl.Locale(new Intl.DateTimeFormat().resolvedOptions().locale);
+  const info = typeof locale.getWeekInfo === "function" ? locale.getWeekInfo() : locale.weekInfo;
+  const weekStart = info ? info.firstDay % 7 : 1;
+  const name = new Date(2026, 0, 4 + weekStart).toLocaleDateString([], { weekday: "short" });
+  assert.strictEqual(picker.find("oc-picker-weekday")[0].text, name);
+  const firstCell = Number(picker.find("oc-picker-day")[0].text);
+  assert.strictEqual((firstCell > 20 ? new Date(2026, 9, firstCell) : new Date(2026, 10, firstCell)).getDay(), weekStart);
+  // Without that, Obsidian's language decides.
+  const { moment } = require(stubPath);
+  const realLocale = Intl.Locale;
+  Intl.Locale = function () {
+    throw new Error("unsupported");
+  };
+  moment.localeData = () => ({ firstDayOfWeek: () => 0 });
+  try {
+    view.closePicker();
+    view.titleEl.listeners.click();
+    const sunday = new Date(2026, 0, 4).toLocaleDateString([], { weekday: "short" });
+    assert.strictEqual(picker.find("oc-picker-weekday")[0].text, sunday);
+    assert.strictEqual(picker.find("oc-picker-day")[0].text, "1", "November 2026 starts on a Sunday");
+  } finally {
+    Intl.Locale = realLocale;
+    delete moment.localeData;
+  }
+  // The setting overrides both.
+  for (const [setting, first] of [["monday", "26"], ["sunday", "1"]]) {
+    plugin.settings.weekStart = setting;
+    view.closePicker();
+    view.titleEl.listeners.click();
+    assert.strictEqual(picker.find("oc-picker-day")[0].text, first, setting);
+  }
 });
 
 (async () => {

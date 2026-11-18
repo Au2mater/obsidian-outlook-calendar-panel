@@ -6,7 +6,10 @@ own, indented like the line you dropped it on. Or use an event's **+** button
 to add it below the cursor. The command **Insert the day's agenda** adds every
 event of the day at once.
 
-- **‹ ›** step through days, and **Today** jumps back.
+- **‹ ›** step through days, and **Today** jumps back. Click the date to pick
+  a day from a month calendar. It names days and months in your system's
+  language, and starts the week where that language does,
+  unless you choose Monday or Sunday under **Start week on**.
 - Open a daily note and the panel shows that note's day. Leave it and the
   panel goes back to today, unless you picked a day yourself. The date is read
   from the file name with the **Daily note date format** setting.
@@ -57,9 +60,11 @@ The plugin is built not to slow Obsidian down:
 - The icons beside event lines only look at the lines on screen, only when
   the text, the visible part or the fetched events change, and each distinct
   line text is matched once, so moving the cursor costs nothing and typing
-  costs one lookup for the line being typed. Until the panel has read its
-  cache, there are no icons, so an editor opened at startup reads neither
-  the sign-in nor the cache.
+  costs one lookup for the line being typed. The first time a note shows a
+  list item or a time, the plugin reads the sign-in and the cached events
+  once, without the network, after Obsidian has finished starting and is
+  idle, so the icons show even when the panel is closed or hidden. Before
+  that, an editor reads neither.
 - One timer a minute moves the "now" highlight and refreshes a day older than
   **Refresh after** (15 minutes by default), and only while the panel is on
   screen.

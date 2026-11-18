@@ -23,7 +23,14 @@ class Plugin {
         getActiveViewOfType: () => null,
         getMostRecentLeaf: () => null,
         setActiveLeaf() {},
-        onLayoutReady: (fn) => (global.__layoutReady = fn),
+        // Every waiting callback runs when a test calls global.__layoutReady().
+        onLayoutReady: (fn) => {
+          const earlier = global.__layoutReady;
+          global.__layoutReady = () => {
+            if (earlier) earlier();
+            fn();
+          };
+        },
       },
       vault: { on: () => ({}), getName: () => "Test vault" },
       metadataCache: { getFileCache: () => global.__fileCache || null },
